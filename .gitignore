@@ -121,6 +121,9 @@ __pycache__/
 !/assets/tailout-256.png
 !/assets/tailout-512.png
 
+# Reviewed README screenshot, captured using generated test media.
+!/media/tailout.png
+
 # Credentials, signing keys, and local environment configuration.
 .env
 .env.*
