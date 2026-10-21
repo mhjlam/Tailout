@@ -224,6 +224,7 @@ pub struct ConversionProgress {
     pub overall: f64,
     pub encoder: Option<&'static str>,
     pub stats: Option<process::FfmpegProgress>,
+    pub clip: Option<(usize, usize)>,
 }
 impl ConversionProgress {
     pub fn stage(phase: &'static str, encoder: Option<&'static str>) -> Self {
@@ -233,6 +234,7 @@ impl ConversionProgress {
             overall: 0.0,
             encoder,
             stats: None,
+            clip: None,
         }
     }
     fn measured(
@@ -249,12 +251,15 @@ impl ConversionProgress {
             overall: 0.0,
             encoder: Some(encoder),
             stats: Some(stats),
+            clip: None,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct Conversion {
+    /// Individual validated exports for a multi-clip source.
+    pub clips: Vec<Conversion>,
     pub status: String,
     pub output: Option<PathBuf>,
     pub source_removed: bool,
@@ -371,6 +376,33 @@ impl Tools {
         cancel: &Cancel,
         progress: &mut dyn FnMut(f64),
     ) -> Result<Option<f64>> {
+        Ok(self
+            .detect_profiled(
+                path,
+                media,
+                start,
+                end,
+                settings,
+                detect::SearchMode::Adaptive,
+                cancel,
+                progress,
+            )?
+            .end)
+    }
+
+    /// Detect an end marker and expose work counters for reproducible benchmarks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn detect_profiled(
+        &self,
+        path: &Path,
+        media: &MediaInfo,
+        start: f64,
+        end: f64,
+        settings: &DetectionSettings,
+        mode: detect::SearchMode,
+        cancel: &Cancel,
+        progress: &mut dyn FnMut(f64),
+    ) -> Result<detect::DetectionResult> {
         media.primary().supported_sdr()?;
         let mut source = VideoFrames {
             tools: self,
@@ -379,8 +411,18 @@ impl Tools {
             settings,
             cancel,
             analyzer: detect::FrameAnalyzer::default(),
+            stats: detect::DetectionStats::default(),
         };
-        detect::detect_end(&mut source, start, end, settings, cancel, progress)
+        let end = match mode {
+            detect::SearchMode::Exact => {
+                detect::detect_end(&mut source, start, end, settings, cancel, progress)?
+            }
+            detect::SearchMode::Adaptive => source.adaptive(start, end, progress)?,
+        };
+        Ok(detect::DetectionResult {
+            end,
+            stats: source.stats,
+        })
     }
 
     pub fn select_encoder(
@@ -462,6 +504,123 @@ impl Tools {
         })
     }
 
+    /// Export kept intervals sequentially while retaining the source until
+    /// every interval has been encoded, validated and published successfully.
+    pub fn convert_clips(
+        &self,
+        input: &Input,
+        settings: &[Settings],
+        cancel: &Cancel,
+        on_progress: &mut dyn FnMut(ConversionProgress),
+    ) -> Result<Conversion> {
+        ensure!(!settings.is_empty(), "No clips to export.");
+        if settings.len() == 1 {
+            return self.convert_with_progress(input, &settings[0], cancel, on_progress);
+        }
+        for value in settings {
+            value.validate()?;
+        }
+        on_progress(ConversionProgress::stage("Reading", None));
+        let source = fs::canonicalize(&input.path)?;
+        let source_lock = open_source(&source)?;
+        let original = source_lock.metadata()?;
+        let info = self.probe(&source, cancel)?;
+        let mut previous = 0.0;
+        let mut durations = Vec::new();
+        for value in settings {
+            let (begin, end) = value.range(info.duration, None)?;
+            ensure!(
+                begin >= previous - 0.00001,
+                "Clips overlap or are out of order."
+            );
+            previous = end;
+            durations.push(end - begin);
+        }
+        let total: f64 = durations.iter().sum();
+        let mut elapsed = 0.0;
+        let mut clips = Vec::new();
+        for (index, value) in settings.iter().enumerate() {
+            let current = fs::metadata(&source)?;
+            ensure!(
+                current.len() == original.len() && current.modified()? == original.modified()?,
+                "Source changed during split export. Original retained."
+            );
+            let mut options = value.clone();
+            let mut clip_input = input.clone();
+            if options.replace_original {
+                options.output_dir = source
+                    .parent()
+                    .context("Missing source folder")?
+                    .to_path_buf();
+                clip_input.relative_dir.clear();
+            }
+            options.replace_original = false;
+            options.delete_original = false;
+            options.force_overwrite = false;
+            options.clip_number = Some(index + 1);
+            let result =
+                self.convert_with_progress(&clip_input, &options, cancel, &mut |mut event| {
+                    event.overall = 0.99 * (elapsed + event.overall * durations[index]) / total;
+                    event.clip = Some((index + 1, settings.len()));
+                    if event.phase == "Done" {
+                        event.phase = "Saving";
+                    }
+                    on_progress(event);
+                });
+            match result {
+                Ok(result) => {
+                    ensure!(
+                        result.output.is_some(),
+                        "Clip {} was not exported. Original retained.",
+                        index + 1
+                    );
+                    clips.push(result);
+                }
+                Err(_error) if cancel.is_cancelled() => bail!(
+                    "Cancelled. {} clip files saved; original retained.",
+                    clips.len()
+                ),
+                Err(error) => {
+                    return Err(error.context(format!(
+                        "Clip {} of {} failed; {} clip files saved. Original retained",
+                        index + 1,
+                        settings.len(),
+                        clips.len()
+                    )));
+                }
+            }
+            elapsed += durations[index];
+        }
+        cancel.check()?;
+        let bytes: u64 = clips
+            .iter()
+            .map(|clip| fs::metadata(clip.output.as_ref().unwrap()).map(|m| m.len()))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .sum();
+        let mut result = clips[0].clone();
+        result.saved_bytes = original.len() as i128 - bytes as i128;
+        result.end = clips.last().unwrap().end;
+        result.quality = clips.iter().flat_map(|clip| clip.quality.clone()).collect();
+        result.clips = clips;
+        if settings[0].replace_original || settings[0].delete_original {
+            drop(source_lock);
+            match remove_exported_source(&source, &original, cancel) {
+                Ok(()) => result.source_removed = true,
+                Err(error) => {
+                    result.warning = Some(format!(
+                        "All clip files saved. Original retained: {error:#}"
+                    ))
+                }
+            }
+        }
+        let mut finished = ConversionProgress::stage("Done", None);
+        finished.overall = 1.0;
+        finished.fraction = Some(1.0);
+        on_progress(finished);
+        Ok(result)
+    }
+
     pub fn convert_with_progress(
         &self,
         input: &Input,
@@ -525,6 +684,7 @@ impl Tools {
         let (start, end) = settings.range(media.duration, detected)?;
         let trimmed = start > 0.00001 || end < media.duration - 0.00001;
         let mut result = Conversion {
+            clips: Vec::new(),
             status: "Already HEVC".into(),
             output: None,
             source_removed: false,
@@ -738,6 +898,7 @@ impl Tools {
                 &mut |fraction, stats| {
                     progress(ConversionProgress {
                         phase: "Comparing",
+                        clip: None,
                         overall: 0.0,
                         fraction,
                         stats: Some(stats),
@@ -778,7 +939,10 @@ impl Tools {
                 .file_stem()
                 .context("Missing filename")?
                 .to_string_lossy();
-            let name = OsString::from(format!("{stem}.hevc.{extension}"));
+            let name = OsString::from(match settings.clip_number {
+                Some(number) => format!("{stem}-{number}.hevc.{extension}"),
+                None => format!("{stem}.hevc.{extension}"),
+            });
             cancel.check()?;
             result.output = Some(publish_unique(staged, &directory, &name)?);
             if settings.delete_original {
@@ -1160,13 +1324,118 @@ struct VideoFrames<'a> {
     settings: &'a DetectionSettings,
     cancel: &'a Cancel,
     analyzer: detect::FrameAnalyzer,
+    stats: detect::DetectionStats,
 }
 impl VideoFrames<'_> {
+    fn adaptive(
+        &mut self,
+        start: f64,
+        end: f64,
+        progress: &mut dyn FnMut(f64),
+    ) -> Result<Option<f64>> {
+        let settings = self.settings;
+        let cancel = self.cancel;
+        settings.validate()?;
+        ensure!(end > start, "Empty analysis range.");
+        // Very short down periods leave little room for sparse sampling.
+        if settings.hold_seconds < 0.5 {
+            return detect::detect_end(self, start, end, settings, cancel, progress);
+        }
+        cancel.check()?;
+        progress(0.0);
+        let cutoff = start + settings.grace_seconds;
+        if cutoff + settings.hold_seconds > end + 0.000001 {
+            cancel.check()?;
+            progress(1.0);
+            return Ok(None);
+        }
+        let mut schedule = detect::ScoutSchedule::new(settings);
+        let lookbehind = schedule.lookbehind();
+        let mut cursor = (cutoff - 0.5).max(start);
+        let mut dense_analyzer = detect::FrameAnalyzer::default();
+        let mut tracker = detect::RunTracker::default();
+        let mut dense_until = f64::NEG_INFINITY;
+        let mut dense_cutoff = cutoff;
+        while cursor < end - 0.000001 {
+            cancel.check()?;
+            let to = (cursor + 16.0).min(end);
+            let frames = self.read_sampled(cursor, to, Some(&mut schedule))?;
+            let windows =
+                detect::candidate_windows(&frames, cutoff, end, settings.hold_seconds, lookbehind);
+            self.stats.merged_candidates += windows.len() as u64;
+            for (from, until) in windows {
+                cancel.check()?;
+                if until <= dense_until + 0.000001 {
+                    continue;
+                }
+                // Overlapping candidates extend the same confirmation stream.
+                // Its analyzer and run onsets cache everything needed from the
+                // previous read, so no dense section is decoded a second time.
+                let read_from = (from - 0.5).max(start);
+                if read_from > dense_until + 0.000001 {
+                    dense_analyzer = detect::FrameAnalyzer::default();
+                    tracker = detect::RunTracker::default();
+                    dense_until = read_from;
+                    dense_cutoff = from;
+                    self.stats.refinement_calls += 1;
+                }
+                std::mem::swap(&mut self.analyzer, &mut dense_analyzer);
+                let result = (|| -> Result<Option<f64>> {
+                    while dense_until < until - 0.000001 {
+                        cancel.check()?;
+                        let next = (dense_until + 4.0).min(until);
+                        for frame in self.read(dense_until, next)? {
+                            if let Some(found) =
+                                tracker.push(frame, dense_cutoff, settings.hold_seconds)
+                            {
+                                return Ok(Some(found));
+                            }
+                        }
+                        dense_until = next;
+                    }
+                    Ok(tracker.finish(until, settings.hold_seconds))
+                })();
+                std::mem::swap(&mut self.analyzer, &mut dense_analyzer);
+                if let Some(found) = result? {
+                    cancel.check()?;
+                    progress(1.0);
+                    return Ok(Some(found));
+                }
+            }
+            cursor = to;
+            progress(((cursor - cutoff) / (end - cutoff)).clamp(0.0, 0.999));
+        }
+        cancel.check()?;
+        progress(1.0);
+        Ok(None)
+    }
     fn read(&mut self, start: f64, end: f64) -> Result<Vec<FramePoint>> {
+        self.read_sampled(start, end, None)
+    }
+    fn read_sampled(
+        &mut self,
+        start: f64,
+        end: f64,
+        mut schedule: Option<&mut detect::ScoutSchedule>,
+    ) -> Result<Vec<FramePoint>> {
+        self.stats.ffmpeg_calls += 1;
         let mut cmd = ffmpeg(self.tools, "info");
         add(&mut cmd, &["-ss", &number(start), "-noautorotate", "-i"]);
         cmd.arg(self.path);
         cmd.args(["-t", &number((end - start).max(0.00001))]);
+        let scout = schedule.is_some();
+        if scout {
+            self.stats.scout_calls += 1;
+        }
+        let selection = schedule
+            .as_ref()
+            .map(|schedule| {
+                format!(
+                    "select='isnan(prev_selected_t)+gte(t-prev_selected_t,{})',",
+                    number(schedule.spacing)
+                )
+            })
+            .unwrap_or_default();
         cmd.args([
             "-map",
             &format!("0:{}", self.video_index),
@@ -1175,7 +1444,7 @@ impl VideoFrames<'_> {
             "-dn",
             "-vf",
             &format!(
-                "scale={}:{},format=rgb24,showinfo",
+                "{selection}scale={}:{},format=rgb24,showinfo",
                 detect::ANALYSIS_WIDTH,
                 detect::ANALYSIS_HEIGHT
             ),
@@ -1209,9 +1478,27 @@ impl VideoFrames<'_> {
             self.cancel.check()?;
             let time = start + relative_time;
             if time < end - 0.000001 {
+                self.stats.frames_analyzed += 1;
+                if scout {
+                    self.stats.scout_frames += 1;
+                } else {
+                    self.stats.dense_frames += 1;
+                }
+                let requested = schedule.as_mut().map_or_else(
+                    || self.settings.enabled_mask(),
+                    |schedule| schedule.requested(time),
+                );
+                let matches = self.analyzer.analyze_requested(
+                    time,
+                    rgb,
+                    self.settings,
+                    requested,
+                    &mut self.stats,
+                );
                 frames.push(FramePoint {
                     time,
-                    matches: self.analyzer.analyze(time, rgb, self.settings),
+                    matches,
+                    still_since: self.analyzer.still_since,
                 });
             }
         }

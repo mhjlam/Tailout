@@ -8,7 +8,7 @@ use std::{
 };
 use tailout::{
     detect::{Criterion, DetectionSettings},
-    editor::{BatchOptions, VideoEdit},
+    editor::{BatchOptions, Clip, VideoEdit},
     media::{Input, Tools},
     model::{Encoder, ResizeMode, Settings},
     process::{self, Cancel},
@@ -215,7 +215,7 @@ fn black_tail_is_found_at_the_frame_boundary_and_used_for_conversion() {
         hold_seconds: 1.5,
         scene_change: false,
         exit_fullscreen: false,
-        loading_spinner: false,
+        still_picture: false,
         ..Default::default()
     };
     let end = tools
@@ -293,7 +293,7 @@ fn first_sustained_event_is_found_even_if_video_recovers() {
         hold_seconds: 1.5,
         scene_change: false,
         exit_fullscreen: false,
-        loading_spinner: false,
+        still_picture: false,
         ..Default::default()
     };
     let end = tools
@@ -359,7 +359,7 @@ fn white_percentage_and_reference_histogram_are_supported() {
         hold_seconds: 1.5,
         scene_change: false,
         exit_fullscreen: false,
-        loading_spinner: false,
+        still_picture: false,
         ..Default::default()
     };
     assert!(
@@ -759,7 +759,7 @@ fn an_audio_tail_is_not_mistaken_for_sustained_black_video() {
         hold_seconds: 1.0,
         scene_change: false,
         exit_fullscreen: false,
-        loading_spinner: false,
+        still_picture: false,
         ..Default::default()
     };
     assert!(
@@ -958,7 +958,7 @@ fn larger_output_exports_but_only_replaces_when_forced() {
 
 #[test]
 #[ignore = "requires FFmpeg and FFprobe on PATH"]
-fn browser_and_animated_spinner_are_detected_independently_after_grace() {
+fn browser_and_still_picture_with_small_animation_are_detected_independently_after_grace() {
     use tailout::detect::{ANALYSIS_HEIGHT as H, ANALYSIS_WIDTH as W};
     let dir = tempfile::tempdir().unwrap();
     let tools = Tools::default();
@@ -1038,7 +1038,7 @@ fn browser_and_animated_spinner_are_detected_independently_after_grace() {
             scene_change: false,
             solid_screen: false,
             exit_fullscreen: !spinner,
-            loading_spinner: spinner,
+            still_picture: spinner,
             ..Default::default()
         };
         let end = tools
@@ -1080,13 +1080,19 @@ fn batch_defaults_and_video_overrides_export_with_independent_markers() {
     batch.video.resize.mode = ResizeMode::Percent;
     batch.video.resize.percent = 50.0;
     let a = VideoEdit {
-        start: "0.5".into(),
-        end: "2".into(),
+        clips: vec![Clip {
+            start: "0.5".into(),
+            end: "2".into(),
+            ..Clip::default()
+        }],
         ..Default::default()
     };
     let mut b = VideoEdit {
-        start: "1".into(),
-        end: "3".into(),
+        clips: vec![Clip {
+            start: "1".into(),
+            end: "3".into(),
+            ..Clip::default()
+        }],
         ..Default::default()
     };
     b.set_video_override(true, &batch);
@@ -1309,4 +1315,167 @@ fn failed_source_cleanup_retains_both_files_and_reports_the_saved_output() {
             .contains(&result.output.unwrap().display().to_string())
     );
     assert_eq!(fs::read(input).unwrap(), bytes);
+}
+
+#[test]
+#[ignore = "requires FFmpeg and FFprobe on PATH"]
+fn split_exports_numbered_independent_ranges_with_continuous_per_video_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("split sample.mp4");
+    fixture(&input, "6");
+    let bytes = fs::read(&input).unwrap();
+    let tools = Tools::default();
+    let mut first = settings(dir.path());
+    first.start = 0.5;
+    first.end = Some(1.5);
+    first.compare = true;
+    let mut second = first.clone();
+    second.start = 4.0;
+    second.end = Some(5.0);
+    let mut progress = Vec::new();
+    let result = tools
+        .convert_clips(
+            &Input::new(input.clone()),
+            &[first, second],
+            &Cancel::default(),
+            &mut |event| progress.push(event),
+        )
+        .unwrap();
+    assert_eq!(result.clips.len(), 2);
+    assert!(!result.source_removed);
+    assert_eq!(fs::read(input).unwrap(), bytes);
+    for (index, clip) in result.clips.iter().enumerate() {
+        let output = clip.output.as_ref().unwrap();
+        assert_eq!(
+            output.file_name().unwrap(),
+            format!("split sample-{}.hevc.mp4", index + 1).as_str()
+        );
+        let info = tools.probe(output, &Cancel::default()).unwrap();
+        assert!((info.duration - 1.0).abs() < 0.15);
+        assert!(!clip.quality.is_empty());
+        assert!(clip.quality.iter().all(|score| score.ssim > 0.90));
+    }
+    assert!(
+        progress
+            .windows(2)
+            .all(|pair| pair[0].overall <= pair[1].overall)
+    );
+    assert_eq!(progress.last().unwrap().overall, 1.0);
+    assert!(progress.iter().any(|event| event.clip == Some((1, 2))));
+    assert!(progress.iter().any(|event| event.clip == Some((2, 2))));
+    assert!(
+        progress
+            .iter()
+            .filter(|event| event.clip.is_some())
+            .all(|event| event.overall < 1.0)
+    );
+}
+#[test]
+#[ignore = "requires FFmpeg and FFprobe on PATH"]
+fn split_replacement_removes_original_only_after_all_clips_and_never_overwrites_collisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("source.mp4");
+    fixture(&input, "5");
+    let existing = dir.path().join("source-1.hevc.mp4");
+    fs::write(&existing, b"Keep this existing file").unwrap();
+    let mut first = settings(dir.path());
+    first.replace_original = true;
+    first.start = 0.5;
+    first.end = Some(1.5);
+    let mut second = first.clone();
+    second.start = 3.0;
+    second.end = Some(4.0);
+    let result = Tools::default()
+        .convert_clips(
+            &Input::new(input.clone()),
+            &[first, second],
+            &Cancel::default(),
+            &mut |_| {},
+        )
+        .unwrap();
+    assert!(result.source_removed);
+    assert!(!input.exists());
+    assert_eq!(fs::read(existing).unwrap(), b"Keep this existing file");
+    assert_eq!(result.clips.len(), 2);
+    assert!(
+        result
+            .clips
+            .iter()
+            .all(|clip| clip.output.as_ref().unwrap().is_file())
+    );
+    assert!(
+        result.clips[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("(1)")
+    );
+}
+#[test]
+#[ignore = "requires FFmpeg and FFprobe on PATH"]
+fn split_failure_after_a_successful_clip_retains_original_and_completed_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("partial.mp4");
+    fixture(&input, "5");
+    let bytes = fs::read(&input).unwrap();
+    let mut first = settings(dir.path());
+    first.replace_original = true;
+    first.start = 0.5;
+    first.end = Some(1.5);
+    let mut second = first.clone();
+    second.start = 3.0;
+    second.end = Some(4.0);
+    second.compare = true;
+    second.min_ssim = Some(1.0);
+    let error = Tools::default()
+        .convert_clips(
+            &Input::new(input.clone()),
+            &[first, second],
+            &Cancel::default(),
+            &mut |_| {},
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("Clip 2 of 2 failed"));
+    assert_eq!(fs::read(input).unwrap(), bytes);
+    assert!(dir.path().join("partial-1.hevc.mp4").is_file());
+    assert!(!dir.path().join("partial-2.hevc.mp4").exists());
+}
+#[test]
+#[ignore = "requires FFmpeg and FFprobe on PATH"]
+fn split_cancellation_between_clips_keeps_original_and_the_first_export() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("cancel split.mp4");
+    fixture(&input, "5");
+    let bytes = fs::read(&input).unwrap();
+    let mut first = settings(dir.path());
+    first.replace_original = true;
+    first.start = 0.5;
+    first.end = Some(1.5);
+    let mut second = first.clone();
+    second.start = 3.0;
+    second.end = Some(4.0);
+    let cancel = Cancel::default();
+    let stop = cancel.clone();
+    let error = Tools::default()
+        .convert_clips(
+            &Input::new(input.clone()),
+            &[first, second],
+            &cancel,
+            &mut |event| {
+                if event.clip == Some((1, 2))
+                    && event.phase == "Saving"
+                    && event.fraction == Some(1.0)
+                {
+                    stop.cancel();
+                }
+            },
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("Cancelled"));
+    assert_eq!(fs::read(input).unwrap(), bytes);
+    assert!(dir.path().join("cancel split-1.hevc.mp4").is_file());
+    assert!(!dir.path().join("cancel split-2.hevc.mp4").exists());
 }

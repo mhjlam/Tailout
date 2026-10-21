@@ -46,9 +46,130 @@ impl Default for VideoOptions {
     }
 }
 
+/// A kept interval. IDs remain stable when clips are selected or reordered.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct Clip {
+    pub id: u64,
+    pub start: String,
+    pub end: String,
+    pub auto_end: bool,
+    /// Manual end edits and explicit per-clip enable/disable choices survive
+    /// later changes to shared detection settings.
+    pub override_auto_end: bool,
+    pub feedback: EndFeedback,
+    pub search_limit: Option<String>,
+}
+impl Default for Clip {
+    fn default() -> Self {
+        Self {
+            id: 1,
+            start: time_text(0.0),
+            end: String::new(),
+            auto_end: false,
+            override_auto_end: false,
+            feedback: EndFeedback::NotSearched,
+            search_limit: None,
+        }
+    }
+}
+impl Clip {
+    pub fn range(&self, duration: f64) -> Result<(f64, f64)> {
+        let begin = parse_time(&self.start)?;
+        let end = optional_time(&self.end)?.unwrap_or(duration).min(duration);
+        ensure!(
+            end - begin >= 0.05,
+            "A clip must contain at least 0.05 seconds."
+        );
+        Ok((begin, end))
+    }
+    pub fn discard_auto_end(&mut self) {
+        self.auto_end = false;
+        self.override_auto_end = true;
+        self.search_limit = None;
+        self.feedback = EndFeedback::NotSearched;
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "StoredVideoEdit")]
 pub struct VideoEdit {
+    pub clips: Vec<Clip>,
+    pub selected_clip: usize,
+    pub playhead: f64,
+    #[serde(flatten)]
+    pub video: VideoOptions,
+    pub override_video: bool,
+    pub override_detection: bool,
+    pub detection: DetectionSettings,
+    pub reference_name: String,
+    /// Scratch editor values when every clip has been removed; never exported.
+    #[serde(skip)]
+    pub empty_clip: Clip,
+}
+impl Default for VideoEdit {
+    fn default() -> Self {
+        StoredVideoEdit::default().into()
+    }
+}
+impl From<StoredVideoEdit> for VideoEdit {
+    fn from(value: StoredVideoEdit) -> Self {
+        let mut clips = value.clips.unwrap_or_else(|| {
+            vec![Clip {
+                start: value.start,
+                end: value.end,
+                auto_end: value.auto_end,
+                override_auto_end: value.override_detection,
+                feedback: value.feedback,
+                search_limit: value.search_limit,
+                ..Clip::default()
+            }]
+        });
+        // Presets from older versions have no IDs. Normalize duplicates too.
+        let mut used = std::collections::BTreeSet::new();
+        for clip in &mut clips {
+            if clip.id == 0 || !used.insert(clip.id) {
+                clip.id = (1..).find(|id| !used.contains(id)).unwrap();
+                used.insert(clip.id);
+            }
+        }
+        let selected_clip = value.selected_clip.min(clips.len().saturating_sub(1));
+        Self {
+            clips,
+            selected_clip,
+            playhead: value.playhead,
+            video: value.video,
+            override_video: value.override_video,
+            override_detection: value.override_detection,
+            detection: value.detection,
+            reference_name: value.reference_name,
+            empty_clip: Clip::default(),
+        }
+    }
+}
+// Marker editing always targets the selected interval; canonical ranges live
+// only in `clips`. An empty list has a disabled scratch editor, not an export.
+impl std::ops::Deref for VideoEdit {
+    type Target = Clip;
+    fn deref(&self) -> &Clip {
+        self.clips
+            .get(self.selected_clip)
+            .unwrap_or(&self.empty_clip)
+    }
+}
+impl std::ops::DerefMut for VideoEdit {
+    fn deref_mut(&mut self) -> &mut Clip {
+        self.clips
+            .get_mut(self.selected_clip)
+            .unwrap_or(&mut self.empty_clip)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct StoredVideoEdit {
+    pub clips: Option<Vec<Clip>>,
+    pub selected_clip: usize,
     pub start: String,
     pub end: String,
     pub playhead: f64,
@@ -63,9 +184,11 @@ pub struct VideoEdit {
     /// Retain the original search ceiling after moving End to a found boundary.
     pub search_limit: Option<String>,
 }
-impl Default for VideoEdit {
+impl Default for StoredVideoEdit {
     fn default() -> Self {
         Self {
+            clips: None,
+            selected_clip: 0,
             start: time_text(0.0),
             end: String::new(),
             playhead: 0.0,
@@ -96,13 +219,23 @@ impl VideoEdit {
     }
     pub fn inherit_detection(&mut self, batch: &BatchOptions) {
         if !self.override_detection {
-            self.auto_end = batch.auto_end;
             self.detection = batch.detection.clone();
             self.reference_name = batch.reference_name.clone();
+        }
+        let final_index = self.clips.len().saturating_sub(1);
+        for (index, clip) in self.clips.iter_mut().enumerate() {
+            if !clip.override_auto_end {
+                clip.auto_end = index == final_index && batch.auto_end;
+            }
         }
     }
     pub fn reset_detection(&mut self, batch: &BatchOptions) {
         self.override_detection = false;
+        for clip in &mut self.clips {
+            clip.override_auto_end = false;
+            clip.feedback = EndFeedback::NotSearched;
+            clip.search_limit = None;
+        }
         self.inherit_detection(batch);
         self.feedback = EndFeedback::NotSearched;
         self.search_limit = None;
@@ -113,8 +246,11 @@ impl VideoEdit {
         preset.override_video = true;
         preset.inherit_detection(batch);
         preset.override_detection = true;
-        preset.feedback = EndFeedback::NotSearched;
-        preset.search_limit = None;
+        for clip in &mut preset.clips {
+            clip.feedback = EndFeedback::NotSearched;
+            clip.search_limit = None;
+            clip.override_auto_end = true;
+        }
         preset
     }
     pub fn from_preset(value: serde_json::Value) -> Result<Self> {
@@ -125,8 +261,16 @@ impl VideoEdit {
         };
         edit.override_video = true;
         edit.override_detection = true;
-        edit.feedback = EndFeedback::NotSearched;
-        edit.search_limit = None;
+        for clip in &mut edit.clips {
+            clip.feedback = EndFeedback::NotSearched;
+            clip.search_limit = None;
+            clip.override_auto_end = true;
+        }
+        // An empty selection is a valid editor/preset state: the queue skips it.
+        // Export still requires at least one kept interval.
+        if !edit.clips.is_empty() {
+            edit.validate_clips(None)?;
+        }
         Ok(edit)
     }
     pub fn settings(&self, batch: &BatchOptions) -> Result<Settings> {
@@ -152,6 +296,7 @@ impl VideoEdit {
             force_overwrite: batch.replace_original && batch.force_overwrite,
             // GUI searches are deliberate. Export uses the marker already shown.
             auto_trim: None,
+            clip_number: None,
         };
         settings.validate()?;
         Ok(settings)
@@ -159,8 +304,16 @@ impl VideoEdit {
     pub fn search_range(&mut self, duration: f64) -> Result<(f64, f64)> {
         self.detection.validate()?;
         let start = parse_time(&self.start)?;
-        let limit = self.search_limit.get_or_insert_with(|| self.end.clone());
+        let current_end = self.end.clone();
+        let limit = self.search_limit.get_or_insert(current_end);
         let end = optional_time(limit)?.unwrap_or(duration).min(duration);
+        let next = self
+            .clips
+            .get(self.selected_clip + 1)
+            .map(|clip| parse_time(&clip.start))
+            .transpose()?
+            .unwrap_or(duration);
+        let end = end.min(next);
         ensure!(end > start, "The search range is empty.");
         Ok((start, end))
     }
@@ -175,10 +328,7 @@ impl VideoEdit {
         }
     }
     pub fn discard_auto_end(&mut self) {
-        self.auto_end = false;
-        self.override_detection = true;
-        self.search_limit = None;
-        self.feedback = EndFeedback::NotSearched;
+        std::ops::DerefMut::deref_mut(self).discard_auto_end();
     }
     pub fn set_manual_end(&mut self, time: f64) {
         self.end = time_text(time);
@@ -195,10 +345,150 @@ impl VideoEdit {
         };
     }
     pub fn same_search(&self, other: &Self) -> bool {
-        self.start == other.start
-            && self.end == other.end
-            && self.auto_end == other.auto_end
-            && self.detection == other.detection
+        self.detection == other.detection
+            && self.clips.len() == other.clips.len()
+            && self.clips.iter().zip(&other.clips).all(|(a, b)| {
+                a.id == b.id && a.start == b.start && a.end == b.end && a.auto_end == b.auto_end
+            })
+    }
+    pub fn validate_clips(&self, duration: Option<f64>) -> Result<()> {
+        ensure!(
+            !self.clips.is_empty(),
+            "Add at least one clip to export this video."
+        );
+        let mut previous_end = 0.0;
+        for (index, clip) in self.clips.iter().enumerate() {
+            let begin = parse_time(&clip.start)?;
+            let end = optional_time(&clip.end)?
+                .unwrap_or(duration.unwrap_or(f64::INFINITY))
+                .min(duration.unwrap_or(f64::INFINITY));
+            ensure!(
+                end - begin >= 0.05,
+                "Clip {} is empty or outside the video.",
+                index + 1
+            );
+            ensure!(
+                begin >= previous_end - 0.00001,
+                "Clip {} overlaps the previous clip.",
+                index + 1
+            );
+            previous_end = end;
+        }
+        Ok(())
+    }
+    pub fn export_settings(
+        &self,
+        batch: &BatchOptions,
+        duration: Option<f64>,
+    ) -> Result<Vec<Settings>> {
+        self.validate_clips(duration)?;
+        (0..self.clips.len())
+            .map(|index| {
+                let mut edit = self.clone();
+                edit.selected_clip = index;
+                edit.settings(batch)
+            })
+            .collect()
+    }
+    pub fn select_clip(&mut self, index: usize) {
+        if index < self.clips.len() {
+            self.selected_clip = index;
+        }
+    }
+    pub fn constrain_selected(&mut self, duration: f64) {
+        if self.clips.is_empty() {
+            return;
+        }
+        let index = self.selected_clip;
+        let left = index
+            .checked_sub(1)
+            .and_then(|i| optional_time(&self.clips[i].end).ok().flatten())
+            .unwrap_or(0.0);
+        let right = self
+            .clips
+            .get(index + 1)
+            .and_then(|clip| parse_time(&clip.start).ok())
+            .unwrap_or(duration)
+            .min(duration);
+        let Ok(begin) = parse_time(&self.start) else {
+            return;
+        };
+        let Ok(end) = optional_time(&self.end) else {
+            return;
+        };
+        let begin = begin.clamp(left, (right - 0.05).max(left));
+        let bounded_end = end
+            .unwrap_or(duration)
+            .clamp((begin + 0.05).min(right), right);
+        if parse_time(&self.start).ok() != Some(begin) {
+            self.start = time_text(begin);
+        }
+        if end.is_some_and(|end| end != bounded_end) || (end.is_none() && right < duration) {
+            self.end = time_text(bounded_end);
+        }
+    }
+    pub fn split_here(&mut self, duration: f64) -> Result<()> {
+        ensure!(!self.clips.is_empty(), "Select a clip to split.");
+        let (begin, end) = self.range(duration)?;
+        let at = self.playhead;
+        ensure!(
+            at - begin >= 0.05 && end - at >= 0.05,
+            "Place the playhead inside a clip, away from its markers."
+        );
+        let mut trailing = self.clips[self.selected_clip].clone();
+        trailing.id = (1..)
+            .find(|id| self.clips.iter().all(|clip| clip.id != *id))
+            .unwrap();
+        trailing.start = time_text(at);
+        trailing.feedback = EndFeedback::NotSearched;
+        trailing.search_limit = None;
+        self.end = time_text(at);
+        self.discard_auto_end();
+        self.clips.insert(self.selected_clip + 1, trailing);
+        self.selected_clip += 1;
+        Ok(())
+    }
+    pub fn add_clip(&mut self, duration: f64) -> Result<()> {
+        let at = self.playhead.clamp(0.0, duration);
+        for clip in &self.clips {
+            let (begin, end) = clip.range(duration)?;
+            ensure!(
+                at < begin || at >= end,
+                "The playhead is already in a kept clip. Use Split here."
+            );
+        }
+        let index = self
+            .clips
+            .iter()
+            .position(|clip| parse_time(&clip.start).is_ok_and(|begin| begin > at))
+            .unwrap_or(self.clips.len());
+        let end = self
+            .clips
+            .get(index)
+            .map(|clip| clip.start.clone())
+            .unwrap_or_default();
+        let limit = optional_time(&end)?.unwrap_or(duration);
+        ensure!(limit - at >= 0.05, "There is no room for a clip here.");
+        let id = (1..)
+            .find(|id| self.clips.iter().all(|clip| clip.id != *id))
+            .unwrap();
+        self.clips.insert(
+            index,
+            Clip {
+                id,
+                start: time_text(at),
+                end,
+                ..Clip::default()
+            },
+        );
+        self.selected_clip = index;
+        Ok(())
+    }
+    pub fn remove_clip(&mut self) {
+        if self.selected_clip < self.clips.len() {
+            self.clips.remove(self.selected_clip);
+        }
+        self.selected_clip = self.selected_clip.min(self.clips.len().saturating_sub(1));
     }
     pub fn from_legacy(settings: Settings) -> Self {
         let video = VideoOptions {
@@ -211,12 +501,16 @@ impl VideoEdit {
             min_ssim: settings.min_ssim.unwrap_or(0.95),
         };
         Self {
-            start: time_text(settings.start),
-            end: settings.end.map(time_text).unwrap_or_default(),
+            clips: vec![Clip {
+                start: time_text(settings.start),
+                end: settings.end.map(time_text).unwrap_or_default(),
+                auto_end: settings.auto_trim.is_some(),
+                override_auto_end: true,
+                ..Clip::default()
+            }],
             video,
             override_video: true,
             override_detection: true,
-            auto_end: settings.auto_trim.is_some(),
             detection: settings.auto_trim.unwrap_or_default(),
             ..Self::default()
         }
@@ -305,15 +599,17 @@ impl Preset {
         .settings(&BatchOptions::default())?;
         match &preset {
             Self::Batch(value) if value.auto_end => value.detection.validate()?,
-            Self::Video(value) if value.auto_end => value.detection.validate()?,
+            Self::Video(value) if value.clips.iter().any(|clip| clip.auto_end) => {
+                value.detection.validate()?
+            }
             _ => {}
         }
         Ok(preset)
     }
     pub fn to_value(&self) -> serde_json::Value {
         match self {
-            Self::Batch(batch) => serde_json::json!({"version":5,"scope":"batch","batch":batch}),
-            Self::Video(video) => serde_json::json!({"version":5,"scope":"video","video":video}),
+            Self::Batch(batch) => serde_json::json!({"version":6,"scope":"batch","batch":batch}),
+            Self::Video(video) => serde_json::json!({"version":6,"scope":"video","video":video}),
         }
     }
     fn processing(&self) -> &VideoOptions {
@@ -326,8 +622,8 @@ impl Preset {
         match self {
             Self::Batch(value) => *batch = value,
             Self::Video(value) => {
+                batch.auto_end = value.clips.last().is_some_and(|clip| clip.auto_end);
                 batch.video = value.video;
-                batch.auto_end = value.auto_end;
                 batch.detection = value.detection;
                 batch.reference_name = value.reference_name;
             }
@@ -338,7 +634,13 @@ impl Preset {
             Self::Batch(value) => {
                 edit.video = value.video;
                 edit.override_video = true;
-                edit.auto_end = value.auto_end;
+                let final_index = edit.clips.len().saturating_sub(1);
+                for (index, clip) in edit.clips.iter_mut().enumerate() {
+                    clip.auto_end = index == final_index && value.auto_end;
+                    clip.override_auto_end = true;
+                    clip.feedback = EndFeedback::NotSearched;
+                    clip.search_limit = None;
+                }
                 edit.detection = value.detection;
                 edit.reference_name = value.reference_name;
                 edit.override_detection = true;
@@ -411,6 +713,7 @@ pub struct ProgramOptions {
     pub seek_step: f64,
     pub view: ViewMode,
     pub queue_sort: QueueSort,
+    pub find_all_clips: bool,
 }
 impl Default for ProgramOptions {
     fn default() -> Self {
@@ -419,6 +722,7 @@ impl Default for ProgramOptions {
             seek_step: 1.0,
             view: ViewMode::default(),
             queue_sort: QueueSort::default(),
+            find_all_clips: false,
         }
     }
 }
@@ -445,18 +749,24 @@ mod tests {
     fn batch_processing_changes_apply_to_existing_and_new_videos_without_changing_marker_state() {
         let mut batch = BatchOptions::default();
         let mut a = VideoEdit {
-            start: "5".into(),
-            end: "30".into(),
+            clips: vec![Clip {
+                start: "5".into(),
+                end: "30".into(),
+                auto_end: true,
+                ..Clip::default()
+            }],
             playhead: 12.0,
-            auto_end: true,
             ..Default::default()
         };
         a.detection.hold_seconds = 4.0;
         a.feedback = EndFeedback::Found(30.0);
         a.search_limit = Some("60".into());
         let mut b = VideoEdit {
-            start: "10".into(),
-            end: "40".into(),
+            clips: vec![Clip {
+                start: "10".into(),
+                end: "40".into(),
+                ..Clip::default()
+            }],
             playhead: 15.0,
             ..Default::default()
         };
@@ -490,9 +800,12 @@ mod tests {
         let mut batch = BatchOptions::default();
         batch.video.quality = 19;
         let mut edit = VideoEdit {
-            start: "7".into(),
-            end: "28".into(),
-            auto_end: true,
+            clips: vec![Clip {
+                start: "7".into(),
+                end: "28".into(),
+                auto_end: true,
+                ..Clip::default()
+            }],
             ..Default::default()
         };
         let detection = edit.detection.clone();
@@ -564,12 +877,16 @@ mod tests {
         let saved = Preset::Batch(batch.clone());
         assert_eq!(Preset::from_value(saved.to_value()).unwrap(), saved);
         let edit = VideoEdit {
-            start: "5".into(),
-            end: "25".into(),
-            auto_end: true,
+            clips: vec![Clip {
+                start: "5".into(),
+                end: "25".into(),
+                auto_end: true,
+                feedback: EndFeedback::Searching,
+                override_auto_end: true,
+                search_limit: Some("30".into()),
+                ..Clip::default()
+            }],
             override_detection: true,
-            feedback: EndFeedback::Searching,
-            search_limit: Some("30".into()),
             ..Default::default()
         };
         let Preset::Video(loaded) =
@@ -602,13 +919,16 @@ mod tests {
             ..Default::default()
         };
         let mut video = VideoEdit {
-            start: "7".into(),
-            end: "27".into(),
+            clips: vec![Clip {
+                start: "7".into(),
+                end: "27".into(),
+                auto_end: true,
+                feedback: EndFeedback::Searching,
+                search_limit: Some("40".into()),
+                ..Clip::default()
+            }],
             playhead: 13.0,
-            auto_end: true,
             override_detection: true,
-            feedback: EndFeedback::Searching,
-            search_limit: Some("40".into()),
             ..Default::default()
         };
         video.detection.hold_seconds = 5.0;
@@ -626,6 +946,7 @@ mod tests {
         expected.override_video = true;
         expected.override_detection = true;
         expected.auto_end = batch.auto_end;
+        expected.override_auto_end = true;
         expected.detection = batch.detection.clone();
         expected.reference_name = batch.reference_name.clone();
         expected.feedback = EndFeedback::NotSearched;
@@ -645,13 +966,19 @@ mod tests {
         };
         batch.detection.hold_seconds = 4.0;
         let mut first = VideoEdit {
-            start: "5".into(),
-            end: "95".into(),
+            clips: vec![Clip {
+                start: "5".into(),
+                end: "95".into(),
+                ..Clip::default()
+            }],
             ..Default::default()
         };
         let mut second = VideoEdit {
-            start: "8".into(),
-            end: "98".into(),
+            clips: vec![Clip {
+                start: "8".into(),
+                end: "98".into(),
+                ..Clip::default()
+            }],
             ..Default::default()
         };
         first.inherit_detection(&batch);
@@ -667,7 +994,7 @@ mod tests {
         second.set_manual_end(90.0);
         second.inherit_detection(&batch);
         assert!(!second.auto_end);
-        assert!(second.override_detection && !second.override_video);
+        assert!(second.override_auto_end && !second.override_detection && !second.override_video);
         second.reset_detection(&batch);
         assert!(second.auto_end && !second.override_detection);
         assert_eq!(second.end, time_text(90.0));
@@ -695,6 +1022,8 @@ mod tests {
         batch.detection.reference_enabled = true;
         batch.detection.reference = Some(crate::detect::Histogram::from_rgb(&[64, 128, 192]));
         batch.detection.hold_seconds = 3.5;
+        batch.detection.still_changed_fraction = 0.035;
+        batch.detection.still_pixel_tolerance = 22;
         batch.reference_name = "reference.png".into();
         let Preset::Batch(loaded) =
             Preset::from_value(Preset::Batch(batch.clone()).to_value()).unwrap()
@@ -703,8 +1032,11 @@ mod tests {
         };
         assert_eq!(loaded, batch);
         let edit = VideoEdit {
-            start: "3".into(),
-            end: "23".into(),
+            clips: vec![Clip {
+                start: "3".into(),
+                end: "23".into(),
+                ..Clip::default()
+            }],
             playhead: 8.0,
             ..Default::default()
         };
@@ -748,8 +1080,11 @@ mod tests {
         let mut batch = BatchOptions::default();
         batch.video.quality = 17;
         let edit = VideoEdit {
-            start: "6".into(),
-            end: "26".into(),
+            clips: vec![Clip {
+                start: "6".into(),
+                end: "26".into(),
+                ..Clip::default()
+            }],
             ..Default::default()
         };
         let encoded = serde_json::json!({"version":3,"video":edit.preset(&batch)});
@@ -784,8 +1119,11 @@ mod tests {
             ..Default::default()
         };
         let a = VideoEdit {
-            start: "5".into(),
-            end: "20".into(),
+            clips: vec![Clip {
+                start: "5".into(),
+                end: "20".into(),
+                ..Clip::default()
+            }],
             video: VideoOptions {
                 quality: 18,
                 ..Default::default()
@@ -794,8 +1132,11 @@ mod tests {
             ..Default::default()
         };
         let b = VideoEdit {
-            start: "2".into(),
-            end: "10".into(),
+            clips: vec![Clip {
+                start: "2".into(),
+                end: "10".into(),
+                ..Clip::default()
+            }],
             video: VideoOptions {
                 quality: 26,
                 ..Default::default()
@@ -821,7 +1162,10 @@ mod tests {
     #[test]
     fn found_marker_is_used_and_search_is_not_silently_repeated() {
         let mut edit = VideoEdit {
-            auto_end: true,
+            clips: vec![Clip {
+                auto_end: true,
+                ..Clip::default()
+            }],
             ..Default::default()
         };
         assert_eq!(edit.search_range(120.0).unwrap(), (0.0, 120.0));
@@ -841,7 +1185,10 @@ mod tests {
     #[test]
     fn no_match_keeps_end_and_manual_edits_reset_search_ceiling() {
         let mut edit = VideoEdit {
-            end: "80".into(),
+            clips: vec![Clip {
+                end: "80".into(),
+                ..Clip::default()
+            }],
             ..Default::default()
         };
         edit.search_range(100.0).unwrap();
@@ -902,5 +1249,161 @@ mod tests {
             let mode: ViewMode = serde_json::from_str(&format!("\"{legacy}\"")).unwrap();
             assert_eq!(mode, ViewMode::Fit);
         }
+    }
+    #[test]
+    fn clips_split_add_remove_and_allow_an_empty_selection() {
+        let mut edit = VideoEdit {
+            playhead: 10.0,
+            ..Default::default()
+        };
+        edit.split_here(30.0).unwrap();
+        assert_eq!(edit.clips.len(), 2);
+        assert_eq!(edit.selected_clip, 1);
+        assert_eq!(edit.clips[0].range(30.0).unwrap(), (0.0, 10.0));
+        assert_eq!(edit.clips[1].range(30.0).unwrap(), (10.0, 30.0));
+        edit.start = "20".into();
+        edit.validate_clips(Some(30.0)).unwrap();
+        edit.playhead = 15.0;
+        edit.add_clip(30.0).unwrap();
+        assert_eq!(edit.selected_clip, 1);
+        assert_eq!(edit.range(30.0).unwrap(), (15.0, 20.0));
+        assert_ne!(edit.clips[1].id, edit.clips[2].id);
+        edit.remove_clip();
+        assert_eq!(edit.clips.len(), 2);
+        edit.remove_clip();
+        edit.remove_clip();
+        assert!(edit.clips.is_empty());
+        assert!(
+            edit.export_settings(&BatchOptions::default(), Some(30.0))
+                .is_err()
+        );
+        edit.playhead = 3.0;
+        edit.add_clip(30.0).unwrap();
+        assert_eq!(edit.range(30.0).unwrap(), (3.0, 30.0));
+    }
+    #[test]
+    fn clip_boundaries_cannot_cross_neighbors_and_exports_reject_overlap() {
+        let mut edit = VideoEdit {
+            playhead: 10.0,
+            ..Default::default()
+        };
+        edit.split_here(30.0).unwrap();
+        edit.start = "20".into();
+        edit.selected_clip = 0;
+        edit.end = "25".into();
+        assert!(edit.validate_clips(Some(30.0)).is_err());
+        edit.constrain_selected(30.0);
+        assert_eq!(edit.end, time_text(20.0));
+        edit.selected_clip = 1;
+        edit.start = "5".into();
+        edit.constrain_selected(30.0);
+        assert_eq!(edit.start, time_text(20.0));
+        edit.validate_clips(Some(30.0)).unwrap();
+        assert!(edit.add_clip(30.0).is_err());
+    }
+    #[test]
+    fn clip_detection_inherits_on_final_clip_and_manual_overrides_are_local() {
+        let mut batch = BatchOptions {
+            auto_end: true,
+            ..Default::default()
+        };
+        let mut edit = VideoEdit::default();
+        edit.inherit_detection(&batch);
+        edit.playhead = 150.0;
+        edit.split_here(400.0).unwrap();
+        assert!(!edit.clips[0].auto_end && edit.clips[1].auto_end);
+        edit.set_manual_end(350.0);
+        assert!(!edit.auto_end && edit.override_auto_end);
+        assert!(!edit.override_detection);
+        batch.detection.hold_seconds = 5.0;
+        edit.inherit_detection(&batch);
+        assert!(!edit.auto_end);
+        assert_eq!(edit.detection.hold_seconds, 5.0);
+        edit.reset_detection(&batch);
+        assert!(edit.auto_end);
+        assert_eq!(edit.end, time_text(350.0));
+    }
+    #[test]
+    fn clip_presets_migrate_legacy_and_roundtrip_every_range_without_search_state() {
+        let legacy = serde_json::json!({"version":5,"scope":"video","video":{"start":"2","end":"20","auto_end":true,"override_detection":true}});
+        let Preset::Video(mut edit) = Preset::from_value(legacy).unwrap() else {
+            panic!()
+        };
+        assert_eq!(edit.clips.len(), 1);
+        assert!(edit.auto_end && edit.override_auto_end);
+        edit.playhead = 10.0;
+        edit.split_here(30.0).unwrap();
+        edit.feedback = EndFeedback::Searching;
+        let preset = Preset::Video(edit.preset(&BatchOptions::default()));
+        let value = preset.to_value();
+        assert_eq!(value["version"], 6);
+        let Preset::Video(restored) = Preset::from_value(value).unwrap() else {
+            panic!()
+        };
+        assert_eq!(restored.clips.len(), 2);
+        assert_eq!(restored.selected_clip, 1);
+        assert!(
+            restored.clips.iter().all(
+                |clip| clip.feedback == EndFeedback::NotSearched && clip.search_limit.is_none()
+            )
+        );
+        assert_eq!(restored.clips[0].end, time_text(10.0));
+        assert_eq!(restored.clips[1].start, time_text(10.0));
+        edit.clips.clear();
+        let empty = Preset::Video(edit.preset(&BatchOptions::default()));
+        let Preset::Video(restored) = Preset::from_value(empty.to_value()).unwrap() else {
+            panic!()
+        };
+        assert!(restored.clips.is_empty());
+        assert!(
+            restored
+                .export_settings(&BatchOptions::default(), Some(30.0))
+                .is_err()
+        );
+    }
+    #[test]
+    fn clip_search_ceiling_stops_before_the_next_kept_range() {
+        let mut edit = VideoEdit {
+            playhead: 150.0,
+            ..Default::default()
+        };
+        edit.split_here(400.0).unwrap();
+        edit.selected_clip = 0;
+        edit.end = "140".into();
+        edit.search_limit = Some("400".into());
+        assert_eq!(edit.search_range(400.0).unwrap(), (0.0, 150.0));
+        edit.apply_match(None);
+        assert_eq!(edit.end, "140");
+    }
+    #[test]
+    fn clip_exports_share_encoding_but_keep_independent_markers_and_preset_scope() {
+        let mut batch = BatchOptions::default();
+        batch.video.quality = 19;
+        let mut edit = VideoEdit {
+            playhead: 10.0,
+            ..Default::default()
+        };
+        edit.split_here(30.0).unwrap();
+        edit.start = "20".into();
+        let settings = edit.export_settings(&batch, Some(30.0)).unwrap();
+        assert_eq!(settings.len(), 2);
+        assert!(settings.iter().all(|value| value.quality == 19));
+        assert_eq!(settings[0].range(30.0, None).unwrap(), (0.0, 10.0));
+        assert_eq!(settings[1].range(30.0, None).unwrap(), (20.0, 30.0));
+        let before = edit
+            .clips
+            .iter()
+            .map(|clip| (clip.start.clone(), clip.end.clone()))
+            .collect::<Vec<_>>();
+        batch.auto_end = true;
+        Preset::Batch(batch).apply_to_video(&mut edit);
+        assert_eq!(
+            before,
+            edit.clips
+                .iter()
+                .map(|clip| (clip.start.clone(), clip.end.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert!(!edit.clips[0].auto_end && edit.clips[1].auto_end);
     }
 }

@@ -133,6 +133,8 @@ pub struct Settings {
     pub compare: bool,
     pub min_ssim: Option<f64>,
     pub auto_trim: Option<crate::detect::DetectionSettings>,
+    /// Numbered output for a kept interval; never used for source replacement.
+    pub clip_number: Option<usize>,
 }
 
 impl Default for Settings {
@@ -157,6 +159,7 @@ impl Default for Settings {
             compare: false,
             min_ssim: None,
             auto_trim: None,
+            clip_number: None,
         }
     }
 }
@@ -181,6 +184,11 @@ impl Settings {
         ensure!(
             self.replace_original || !self.output_dir.as_os_str().is_empty(),
             "Choose an output folder."
+        );
+        ensure!(
+            self.clip_number
+                .is_none_or(|number| number > 0 && !self.replace_original),
+            "Numbered clips must be saved as separate files."
         );
         if let Some(value) = self.min_ssim {
             ensure!(

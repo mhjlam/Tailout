@@ -9,7 +9,7 @@ use std::{
 use tailout::{
     detect::Criterion,
     editor::{
-        BatchOptions, EndFeedback, Preset, ProgramOptions, QueueSort, Session, VideoEdit,
+        BatchOptions, Clip, EndFeedback, Preset, ProgramOptions, QueueSort, Session, VideoEdit,
         VideoOptions, ViewMode, optional_time,
     },
     media::{self, Conversion, ConversionProgress, FrameImage, Input, MediaInfo, Tools},
@@ -32,6 +32,8 @@ struct Item {
     probe_pending: bool,
     probe_cancel: Cancel,
     find_ticket: u64,
+    find_clip: Option<u64>,
+    clip_undo: Vec<(Vec<Clip>, usize)>,
     find_cancel: Cancel,
     find_progress: f32,
     find_started: Option<Instant>,
@@ -42,11 +44,16 @@ impl Item {
         self.error
             .as_deref()
             .filter(|message| !message.trim().is_empty())
-            .or_else(|| match &self.edit.feedback {
-                EndFeedback::Failed(message) if !message.trim().is_empty() => {
-                    Some(message.as_str())
-                }
-                _ => None,
+            .or_else(|| {
+                self.edit
+                    .clips
+                    .iter()
+                    .find_map(|clip| match &clip.feedback {
+                        EndFeedback::Failed(message) if !message.trim().is_empty() => {
+                            Some(message.as_str())
+                        }
+                        _ => None,
+                    })
             })
     }
     fn new(id: u64, input: Input, edit: VideoEdit) -> Self {
@@ -62,6 +69,8 @@ impl Item {
             probe_pending: false,
             probe_cancel: Cancel::default(),
             find_ticket: 0,
+            find_clip: None,
+            clip_undo: Vec::new(),
             find_cancel: Cancel::default(),
             find_progress: 0.0,
             find_started: None,
@@ -86,8 +95,8 @@ enum Message {
     Preview(u64, u64, f64, Result<FrameImage, String>),
     Reference(u64, u64, Result<(FrameImage, String), String>),
     BatchReference(u64, Result<(FrameImage, String), String>),
-    Found(u64, u64, Result<Option<f64>, String>),
-    FindProgress(u64, u64, f64, Option<(usize, usize)>),
+    Found(u64, u64, u64, Result<Option<f64>, String>),
+    FindProgress(u64, u64, u64, f64, Option<(usize, usize)>),
     Progress(u64, usize, usize, ConversionProgress),
     Converted(u64, Result<Conversion, String>),
     DeleteProgress(DeleteTarget),
@@ -105,8 +114,8 @@ struct PreviewRequest {
 #[derive(Clone, Copy)]
 enum DragTarget {
     Playhead,
-    Begin,
-    End,
+    Begin(u64),
+    End(u64),
 }
 #[derive(Default)]
 struct Actions {
@@ -163,7 +172,7 @@ impl ExportActivity {
         }
     }
     fn update(&mut self, mut event: ConversionProgress, now: Instant) {
-        if event.phase != self.event.phase {
+        if event.phase != self.event.phase || event.clip != self.event.clip {
             let started = self.started;
             event.overall = event.overall.max(self.event.overall);
             *self = Self::new(self.id, event, now);
@@ -216,9 +225,13 @@ impl ExportActivity {
             Some("libx265") => Some("HEVC (x265)"),
             value => value,
         };
-        match encoder {
+        let label = match encoder {
             Some(encoder) => format!("{} · {encoder}", self.event.phase),
             None => self.event.phase.into(),
+        };
+        match self.event.clip {
+            Some((number, total)) => format!("Clip {number}/{total} · {label}"),
+            None => label,
         }
     }
     fn idle(&self, now: Instant) -> Option<Duration> {
@@ -434,6 +447,26 @@ impl App {
             && let Some(index) = app.selected_index()
         {
             app.items[index].edit.auto_end = true;
+            if std::env::var_os("TAILOUT_UI_SMOKE_CLIPS").is_some() {
+                let edit = &mut app.items[index].edit;
+                edit.clips = vec![
+                    Clip {
+                        start: "15".into(),
+                        end: "65".into(),
+                        ..Clip::default()
+                    },
+                    Clip {
+                        id: 2,
+                        start: "95".into(),
+                        end: "160".into(),
+                        auto_end: true,
+                        override_auto_end: true,
+                        ..Clip::default()
+                    },
+                ];
+                edit.selected_clip = 1;
+                edit.playhead = 110.0;
+            }
         }
         app
     }
@@ -448,9 +481,12 @@ impl App {
         self.busy || self.finding_batch || self.delete_state.is_some()
     }
     fn searching(&self) -> bool {
-        self.items
-            .iter()
-            .any(|item| matches!(item.edit.feedback, EndFeedback::Searching))
+        self.items.iter().any(|item| {
+            item.edit
+                .clips
+                .iter()
+                .any(|clip| matches!(clip.feedback, EndFeedback::Searching))
+        })
     }
     fn spawn(&mut self, action: impl FnOnce(Sender<Message>) + Send + 'static) {
         self.threads.retain(|t| !t.is_finished());
@@ -708,16 +744,60 @@ impl App {
             return;
         }
         let seek = old.playhead != edit.playhead;
-        let discarded = !edit.auto_end
-            && edit.feedback == EndFeedback::NotSearched
-            && old.feedback != edit.feedback;
-        if !old.same_search(&edit) || discarded {
-            let end_changed = old.end != edit.end;
+        let detection_changed = old.detection != edit.detection;
+        let pending = self.items[index].find_clip.or_else(|| {
+            old.clips
+                .iter()
+                .find(|clip| matches!(clip.feedback, EndFeedback::Searching))
+                .map(|clip| clip.id)
+        });
+        let changed = |id| match (
+            old.clips.iter().find(|clip| clip.id == id),
+            edit.clips.iter().find(|clip| clip.id == id),
+        ) {
+            (Some(a), Some(b)) => {
+                a.start != b.start
+                    || a.end != b.end
+                    || a.auto_end != b.auto_end
+                    || (a.feedback != b.feedback && b.feedback == EndFeedback::NotSearched)
+            }
+            _ => true,
+        };
+        let neighbor = |edit: &VideoEdit, id| {
+            edit.clips
+                .iter()
+                .position(|clip| clip.id == id)
+                .and_then(|index| edit.clips.get(index + 1))
+                .map(|clip| clip.start.clone())
+        };
+        let neighbor_changed = pending.is_some_and(|id| neighbor(old, id) != neighbor(&edit, id));
+        let cancel = detection_changed || neighbor_changed || pending.is_some_and(changed);
+        for clip in &mut edit.clips {
+            let previous = old.clips.iter().find(|old| old.id == clip.id);
+            if detection_changed
+                || previous.is_some_and(|old| {
+                    old.start != clip.start || old.end != clip.end || old.auto_end != clip.auto_end
+                })
+            {
+                if clip.feedback != EndFeedback::NotSearched {
+                    clip.feedback = EndFeedback::Stale;
+                }
+                if previous.is_some_and(|old| old.end != clip.end) {
+                    clip.search_limit = None;
+                }
+            }
+        }
+        if cancel {
             self.items[index].find_cancel.cancel();
             self.items[index].find_ticket += 1;
             self.items[index].find_started = None;
             self.items[index].find_progress = 0.0;
-            edit.mark_stale(end_changed);
+            self.items[index].find_clip = None;
+            for clip in &mut edit.clips {
+                if matches!(clip.feedback, EndFeedback::Searching) {
+                    clip.feedback = EndFeedback::Stale;
+                }
+            }
         }
         self.items[index].edit = edit;
         self.dirty();
@@ -727,32 +807,37 @@ impl App {
     }
     fn sync_batch_detection(&mut self) {
         for index in 0..self.items.len() {
-            if !self.items[index].edit.override_detection {
-                let mut edit = self.items[index].edit.clone();
-                edit.inherit_detection(&self.batch);
+            let mut edit = self.items[index].edit.clone();
+            edit.inherit_detection(&self.batch);
+            if !edit.override_detection {
                 self.items[index].reference_ticket += 1;
-                self.commit_edit(index, edit);
             }
+            self.commit_edit(index, edit);
         }
     }
     fn find_selected(&mut self) {
         let Some(index) = self.selected_index() else {
             return;
         };
+        if self.items[index].edit.clips.is_empty() {
+            return;
+        }
         let Some(info) = self.items[index].info.clone() else {
             return;
         };
         let (start, end) = match self.items[index].edit.search_range(info.duration) {
             Ok(range) => range,
-            Err(e) => {
-                self.items[index].edit.feedback = EndFeedback::Failed(e.to_string());
+            Err(error) => {
+                self.items[index].edit.feedback = EndFeedback::Failed(error.to_string());
                 return;
             }
         };
         let item = &mut self.items[index];
-        item.find_cancel.cancel();
+        cancel_find(item);
         item.find_cancel = Cancel::default();
         item.find_ticket += 1;
+        let clip_id = item.edit.id;
+        item.find_clip = Some(clip_id);
         item.edit.feedback = EndFeedback::Searching;
         item.find_progress = 0.0;
         item.find_started = Some(Instant::now());
@@ -763,23 +848,20 @@ impl App {
         let detection = item.edit.detection.clone();
         let tools = self.tools.clone();
         self.spawn(move |tx| {
-            let _ = tx.send(Message::Found(
-                id,
-                ticket,
-                tools
-                    .detect(
-                        &path,
-                        &info,
-                        start,
-                        end,
-                        &detection,
-                        &cancel,
-                        &mut |value| {
-                            let _ = tx.send(Message::FindProgress(id, ticket, value, None));
-                        },
-                    )
-                    .map_err(|e| format!("{e:#}")),
-            ));
+            let result = tools
+                .detect(
+                    &path,
+                    &info,
+                    start,
+                    end,
+                    &detection,
+                    &cancel,
+                    &mut |value| {
+                        let _ = tx.send(Message::FindProgress(id, clip_id, ticket, value, None));
+                    },
+                )
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(Message::Found(id, clip_id, ticket, result));
         });
     }
     fn find_queue(&mut self) {
@@ -792,23 +874,33 @@ impl App {
         let cancel = self.analysis_cancel.clone();
         let mut jobs = Vec::new();
         for item in &mut self.items {
-            if !item.edit.auto_end {
-                continue;
-            }
             item.find_cancel.cancel();
             item.find_ticket += 1;
-            item.edit.feedback = EndFeedback::Searching;
+            let last = item.edit.clips.len().saturating_sub(1);
+            for index in 0..item.edit.clips.len() {
+                if (!self.program.find_all_clips && index != last)
+                    || !item.edit.clips[index].auto_end
+                {
+                    continue;
+                }
+                let clip = &mut item.edit.clips[index];
+                clip.feedback = EndFeedback::Searching;
+                if clip.search_limit.is_none() {
+                    clip.search_limit = Some(clip.end.clone());
+                }
+                let clip_id = clip.id;
+                let mut edit = item.edit.clone();
+                edit.selected_clip = index;
+                jobs.push((
+                    item.id,
+                    clip_id,
+                    item.find_ticket,
+                    item.input.path.clone(),
+                    edit,
+                ));
+            }
             item.find_progress = 0.0;
             item.find_started = None;
-            if item.edit.search_limit.is_none() {
-                item.edit.search_limit = Some(item.edit.end.clone());
-            }
-            jobs.push((
-                item.id,
-                item.find_ticket,
-                item.input.path.clone(),
-                item.edit.clone(),
-            ));
         }
         if jobs.is_empty() {
             return;
@@ -817,13 +909,15 @@ impl App {
         self.progress = 0.0;
         let tools = self.tools.clone();
         self.spawn(move |tx| {
-            for (number, (id, ticket, path, mut edit)) in jobs.iter().cloned().enumerate() {
+            for (number, (id, clip_id, ticket, path, mut edit)) in jobs.iter().cloned().enumerate()
+            {
                 if cancel.is_cancelled() {
                     break;
                 }
                 let mut report = |value| {
                     let _ = tx.send(Message::FindProgress(
                         id,
+                        clip_id,
                         ticket,
                         value,
                         Some((number, jobs.len())),
@@ -844,11 +938,11 @@ impl App {
                         &mut report,
                     )
                 })()
-                .map_err(|e| format!("{e:#}"));
+                .map_err(|error| format!("{error:#}"));
                 if !cancel.is_cancelled() {
                     report(1.0);
                 }
-                let _ = tx.send(Message::Found(id, ticket, result));
+                let _ = tx.send(Message::Found(id, clip_id, ticket, result));
             }
             let _ = tx.send(Message::AnalysisDone);
         });
@@ -866,8 +960,12 @@ impl App {
             .items
             .iter()
             .filter(|item| only.is_none_or(|id| item.id == id))
+            .filter(|item| !item.edit.clips.is_empty())
         {
-            match item.edit.settings(&self.batch) {
+            match item
+                .edit
+                .export_settings(&self.batch, item.info.as_ref().map(|info| info.duration))
+            {
                 Ok(settings) => jobs.push((item.id, item.input.clone(), settings)),
                 Err(e) => {
                     self.error = Some(format!(
@@ -885,10 +983,11 @@ impl App {
         if jobs.is_empty() {
             return;
         }
+        let job_ids: Vec<_> = jobs.iter().map(|(id, _, _)| *id).collect();
         for item in self
             .items
             .iter_mut()
-            .filter(|item| only.is_none_or(|id| item.id == id))
+            .filter(|item| job_ids.contains(&item.id))
         {
             item.status = "Queued".into();
             item.error = None;
@@ -913,7 +1012,7 @@ impl App {
                     Err("Cancelled".into())
                 } else {
                     tools
-                        .convert_with_progress(input, settings, &cancel, &mut |event| {
+                        .convert_clips(input, settings, &cancel, &mut |event| {
                             let _ = tx.send(Message::Progress(*id, number, jobs.len(), event));
                         })
                         .map_err(|e| format!("{e:#}"))
@@ -1001,41 +1100,58 @@ impl App {
                         Err(error) => self.error = Some(error),
                     }
                 }
-                Message::Found(id, ticket, result) => {
+                Message::Found(id, clip_id, ticket, result) => {
                     if let Some(index) = self.index(id)
                         && self.items[index].find_ticket == ticket
+                        && let Some(clip_index) = self.items[index]
+                            .edit
+                            .clips
+                            .iter()
+                            .position(|clip| clip.id == clip_id)
                     {
-                        self.items[index].find_started = None;
-                        self.items[index].find_progress = 1.0;
+                        let item = &mut self.items[index];
+                        item.find_started = None;
+                        item.find_progress = 1.0;
+                        let selected = item.edit.selected_clip;
+                        let playhead = item.edit.playhead;
+                        item.edit.selected_clip = clip_index;
                         match result {
-                            Ok(end) => {
-                                self.items[index].edit.apply_match(end);
-                                if let Some(info) = &self.items[index].info {
-                                    self.items[index].edit.playhead =
-                                        self.items[index].edit.playhead.min(seek_max(info));
-                                }
-                                if self.selected == Some(id) {
-                                    self.request_preview();
-                                }
-                            }
-                            Err(e) => {
-                                self.items[index].edit.feedback = if e == "Cancelled" {
+                            Ok(end) => item.edit.apply_match(end),
+                            Err(error) => {
+                                item.edit.feedback = if error == "Cancelled" {
                                     EndFeedback::Cancelled
                                 } else {
-                                    EndFeedback::Failed(e)
+                                    EndFeedback::Failed(error)
                                 }
                             }
+                        }
+                        if selected != clip_index {
+                            item.edit.playhead = playhead;
+                        }
+                        item.edit.selected_clip = selected;
+                        if let Some(info) = &item.info {
+                            item.edit.playhead = item.edit.playhead.min(seek_max(info));
+                        }
+                        if self.selected == Some(id) && selected == clip_index {
+                            self.request_preview();
                         }
                         self.dirty();
                     }
                 }
-                Message::FindProgress(id, ticket, value, batch) => {
+                Message::FindProgress(id, clip_id, ticket, value, batch) => {
                     if let Some(index) = self.index(id)
                         && self.items[index].find_ticket == ticket
-                        && matches!(self.items[index].edit.feedback, EndFeedback::Searching)
+                        && self.items[index].edit.clips.iter().any(|clip| {
+                            clip.id == clip_id && matches!(clip.feedback, EndFeedback::Searching)
+                        })
                         && value.is_finite()
                     {
                         let item = &mut self.items[index];
+                        if item.find_clip != Some(clip_id) {
+                            item.find_clip = Some(clip_id);
+                            item.find_progress = 0.0;
+                            item.find_started = None;
+                        }
                         item.find_started.get_or_insert_with(Instant::now);
                         item.find_progress = item.find_progress.max(value.clamp(0.0, 1.0) as f32);
                         if let Some((number, total)) = batch {
@@ -1077,9 +1193,15 @@ impl App {
                     if let Some(index) = self.index(id) {
                         match result {
                             Ok(result) => {
+                                let additional = if result.source_removed {
+                                    result.clips.iter().skip(1).cloned().collect::<Vec<_>>()
+                                } else {
+                                    Vec::new()
+                                };
                                 self.items[index].status = result.status.clone();
-                                let replaced =
-                                    self.batch.replace_original && result.output.is_some();
+                                let replaced = self.batch.replace_original
+                                    && result.clips.is_empty()
+                                    && result.output.is_some();
                                 let moved = result.source_removed;
                                 self.items[index].error = result.warning.clone();
                                 if moved {
@@ -1087,6 +1209,9 @@ impl App {
                                     item.input.path = result.output.clone().unwrap();
                                     // The queue now refers to the already-trimmed export.
                                     // Do not apply the old source offsets to it again.
+                                    item.edit.clips = vec![Clip::default()];
+                                    item.edit.selected_clip = 0;
+                                    item.clip_undo.clear();
                                     item.edit.start = "0".into();
                                     item.edit.end.clear();
                                     item.edit.playhead = 0.0;
@@ -1104,9 +1229,24 @@ impl App {
                                 if moved && self.selected == Some(id) {
                                     self.activate_video(id);
                                 }
+                                for conversion in additional {
+                                    if let Some(path) = conversion.output.clone() {
+                                        let id = self.next_id;
+                                        self.next_id += 1;
+                                        let mut edit = self.items[index].edit.clone();
+                                        edit.clips = vec![Clip::default()];
+                                        edit.selected_clip = 0;
+                                        edit.playhead = 0.0;
+                                        edit.discard_auto_end();
+                                        let mut item = Item::new(id, Input::new(path), edit);
+                                        item.status = "Done".into();
+                                        item.result = Some(conversion);
+                                        self.items.push(item);
+                                    }
+                                }
                             }
                             Err(e) => {
-                                self.items[index].status = if e == "Cancelled" {
+                                self.items[index].status = if e.starts_with("Cancelled") {
                                     "Cancelled"
                                 } else {
                                     "Failed"
@@ -1314,7 +1454,7 @@ impl App {
                         self.select(id);
                     }
                     response.context_menu(|ui| {
-                        if ui.add_enabled(!self.locked() && !self.collecting && !self.searching(), egui::Button::new("Process this video"))
+                        if ui.add_enabled(!self.locked() && !self.collecting && !self.searching() && self.index(id).is_some_and(|index|!self.items[index].edit.clips.is_empty()), egui::Button::new("Process this video"))
                             .on_hover_text("Process only this video, even when multiple videos are selected. Uses its markers, inherited or overridden processing settings, and the batch output options.").clicked() {
                             process_video = Some(id);
                             ui.close();
@@ -1562,12 +1702,12 @@ impl App {
                         save = ui.button("Save preset").on_hover_text(if batch {
                             "Save all batch processing, Detect end, reference histogram and output settings. Per-video markers are excluded."
                         } else {
-                            "Save this video's effective processing and Detect end settings, reference histogram, markers and playhead. Batch destination settings are excluded."
+                            "Save this video's effective processing and Detect end settings, reference histogram, all clips and playhead. Batch destination settings are excluded."
                         }).clicked();
                         load = ui.button("Load preset").on_hover_text(if batch {
                             "Load all batch defaults and output settings. A video preset imports processing and Detect end settings without copying its markers."
                         } else {
-                            "Load all per-video settings and markers. A batch preset imports processing and Detect end settings while keeping this video's markers. Other videos are unchanged."
+                            "Load all per-video settings and clips. A batch preset imports processing and Detect end settings while keeping this video's clips. Other videos are unchanged."
                         }).clicked();
                     });
                 });
@@ -1585,9 +1725,12 @@ impl App {
                         ui.indent("replacement_options", |ui| {
                             ui.add_enabled_ui(self.batch.replace_original, |ui| {
                                 ui.checkbox(&mut self.batch.force_overwrite, "Force overwrite")
-                                    .on_hover_text("Replace the original even when the converted file is the same size or larger. All validation and quality checks still apply.");
+                                    .on_hover_text("Replace a single-clip original even when its conversion is the same size or larger. Split clips are always saved separately. All validation and quality checks still apply.");
                             });
                         });
+                        if self.batch.replace_original && self.items.iter().any(|item|item.edit.clips.len()>1) {
+                            ui.label(RichText::new("Split videos: numbered files beside source; source removed after all clips succeed.").small().weak());
+                        }
                         ui.radio_value(&mut self.batch.replace_original, false, "Save to folder")
                             .on_hover_text("Save separate files named filename.hevc.ext in the chosen folder. Existing output names get a unique numbered suffix. The option below controls whether originals are kept.");
                         let output_dir = self.batch.output_dir.clone();
@@ -1603,15 +1746,23 @@ impl App {
                     ui.separator();
                     ui.label(RichText::new("All videos · local detection overrides respected").small().weak());
                     let mut detection = VideoEdit {
-                        auto_end: self.batch.auto_end,
+                        clips: vec![Clip { auto_end: self.batch.auto_end, ..Clip::default() }],
                         detection: self.batch.detection.clone(),
                         reference_name: self.batch.reference_name.clone(),
                         ..Default::default()
                     };
                     ui.add_enabled(enabled, egui::Checkbox::new(&mut detection.auto_end, "Detect end"))
-                        .on_hover_text("Batch default for every video without a local detection override. Find ends in queue searches eligible videos; markers stay individual.");
+                        .on_hover_text("Enable inherited detection on each video's final clip. Queue search controls whether final clips or all explicitly enabled clips are searched. Each clip keeps its own marker.");
                     let activity = self.finding_batch.then_some(SearchActivity { progress: self.progress, elapsed: None, batch: true });
-                    let eligible = self.items.iter().filter(|item| if item.edit.override_detection { item.edit.auto_end } else { detection.auto_end }).count();
+                    ui.horizontal(|ui| {
+                        ui.label("Queue search");
+                        egui::ComboBox::from_id_salt("clip_search_scope").selected_text(if self.program.find_all_clips {"All enabled clips"}else{"Final clips"}).show_ui(ui,|ui| {
+                            ui.selectable_value(&mut self.program.find_all_clips,false,"Final clips");
+                            ui.selectable_value(&mut self.program.find_all_clips,true,"All enabled clips");
+                        }).response.on_hover_text("Final clips finds where each recording ends. All enabled clips also searches internal clips with Detect end enabled. Manual overrides are respected.");
+                    });
+                    let eligible = self.items.iter().filter(|item| item.edit.clips.iter().enumerate().any(|(index,clip)|
+                        (self.program.find_all_clips || index+1==item.edit.clips.len()) && if clip.override_auto_end {clip.auto_end}else{index+1==item.edit.clips.len() && detection.auto_end})).count();
                     ui.label(RichText::new(format!("{eligible} of {} videos enabled", self.items.len())).small().weak());
                     detection_ui(ui, &mut detection, &mut actions, self.frame.is_some(), activity, enabled && !self.searching(), DetectionScope { batch: true, can_find: eligible > 0 });
                     self.batch.auto_end = detection.auto_end;
@@ -1622,9 +1773,9 @@ impl App {
                     ui.add_enabled_ui(enabled, |ui| {
                         let mut reset = false;
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(if edit.override_video || edit.override_detection { "Custom settings" } else { "Using batch settings" }).small().weak());
-                            reset = ui.add_enabled(edit.override_video || edit.override_detection, egui::Button::new("Reset to batch settings"))
-                                .on_hover_text("Restore batch processing and Detect end settings for this video. Its begin and end markers are kept.").clicked();
+                            ui.label(RichText::new(if edit.override_video || edit.override_detection || edit.clips.iter().any(|clip|clip.override_auto_end) { "Custom settings" } else { "Using batch settings" }).small().weak());
+                            reset = ui.add_enabled(edit.override_video || edit.override_detection || edit.clips.iter().any(|clip|clip.override_auto_end), egui::Button::new("Reset to batch settings"))
+                                .on_hover_text("Restore batch processing and Detect end settings for this video. Its clip ranges are kept; detection enablement resumes batch defaults on the final clip.").clicked();
                         });
                         if reset {
                             edit.set_video_override(false, &self.batch);
@@ -1650,20 +1801,22 @@ impl App {
                         }
                     });
                     ui.separator();
-                    ui.label(RichText::new(if edit.override_detection { "Detect end · custom for this video" } else { "Detect end · using batch defaults" }).small().weak());
-                    let initial = (edit.auto_end, edit.detection.clone(), edit.reference_name.clone());
-                    if ui.add_enabled(enabled, egui::Checkbox::new(&mut edit.auto_end, "Detect end"))
-                        .on_hover_text("Find an end marker for this video. Changing these settings creates a local detection override. Manual end edits disable detection for this video.").changed() && !edit.auto_end {
-                        edit.discard_auto_end();
+                    ui.label(RichText::new(if edit.override_detection { "Detector settings · custom for this video" } else { "Detector settings · using batch defaults" }).small().weak());
+                    if !edit.clips.is_empty(){ui.label(RichText::new(format!("End marker · Clip {}",edit.selected_clip+1)).small());}
+                    let initial = (edit.detection.clone(), edit.reference_name.clone());
+                    if ui.add_enabled(enabled && !edit.clips.is_empty(), egui::Checkbox::new(&mut edit.auto_end, "Detect end"))
+                        .on_hover_text("Enable detection for the selected clip. Detector thresholds are shared by this video; manual end edits disable detection only for this clip.").changed() {
+                        edit.override_auto_end=true;
+                        if !edit.auto_end { edit.discard_auto_end(); }
                     }
                     let activity = self.selected_index().and_then(|index| {
                         let item = &self.items[index];
-                        matches!(item.edit.feedback, EndFeedback::Searching).then_some(SearchActivity {
-                            progress: item.find_progress, elapsed: item.find_started.map(|started| started.elapsed()), batch: self.finding_batch,
+                        matches!(edit.feedback, EndFeedback::Searching).then_some(SearchActivity {
+                            progress: if item.find_clip==Some(edit.id){item.find_progress}else{0.0}, elapsed: item.find_started.filter(|_|item.find_clip==Some(edit.id)).map(|started| started.elapsed()), batch: self.finding_batch,
                         })
                     });
-                    detection_ui(ui, edit, &mut actions, self.frame.is_some(), activity, enabled, DetectionScope { batch: false, can_find: info.is_some() });
-                    if initial != (edit.auto_end, edit.detection.clone(), edit.reference_name.clone()) { edit.override_detection = true; }
+                    detection_ui(ui, edit, &mut actions, self.frame.is_some(), activity, enabled, DetectionScope { batch: false, can_find: info.is_some() && !edit.clips.is_empty() });
+                    if initial != (edit.detection.clone(), edit.reference_name.clone()) { edit.override_detection = true; }
                 } else {
                     ui.label(RichText::new("Select a video to edit its settings.").weak());
                 }
@@ -1748,6 +1901,92 @@ impl App {
             }
         }
     }
+    fn remember_clips(&mut self, edit: &VideoEdit) {
+        if let Some(index) = self.selected_index() {
+            let history = &mut self.items[index].clip_undo;
+            if history.len() >= 30 {
+                history.remove(0);
+            }
+            history.push((edit.clips.clone(), edit.selected_clip));
+        }
+    }
+    fn undo_clips(&mut self, edit: &mut VideoEdit) {
+        if let Some(index) = self.selected_index()
+            && let Some((clips, selected)) = self.items[index].clip_undo.pop()
+        {
+            cancel_find(&mut self.items[index]);
+            edit.clips = clips;
+            for clip in &mut edit.clips {
+                if matches!(clip.feedback, EndFeedback::Searching) {
+                    clip.feedback = EndFeedback::Cancelled;
+                    clip.search_limit = None;
+                }
+            }
+            edit.selected_clip = selected;
+            self.drag = None;
+        }
+    }
+    fn clip_bar(&mut self, ui: &mut egui::Ui, edit: &mut VideoEdit, info: &MediaInfo) {
+        let enabled = !self.locked();
+        egui::ScrollArea::horizontal().id_salt("clip_chips").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for index in 0..edit.clips.len() {
+                    let clip = &edit.clips[index];
+                    let range = clip.range(info.duration)
+                        .map(|(a, b)| format!("{}–{}", compact_time(a), compact_time(b)))
+                        .unwrap_or_else(|_| "Invalid range".into());
+                    let response = ui.selectable_label(
+                        edit.selected_clip == index, format!("Clip {} · {range}", index + 1),
+                    );
+                    if response.clicked() {
+                        edit.select_clip(index);
+                        edit.playhead = parse_time(&edit.start).unwrap_or(0.0).min(seek_max(info));
+                        clear_keyboard_focus(ui);
+                    }
+                    response.on_hover_text("Select this kept interval. Its begin/end controls appear below; all clips share this video's encoding settings.");
+                }
+                if edit.clips.is_empty() {
+                    ui.label(RichText::new("No clips · add a kept range to export").weak());
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            let mut added = edit.clone();
+            let can_add = added.add_clip(info.duration).is_ok();
+            if ui.add_enabled(enabled && can_add, egui::Button::new("Add clip"))
+                .on_hover_text("Keep a new range from the playhead to the next clip or video end. Place the playhead in a discarded gap; use Split here inside an existing clip.").clicked()
+            {
+                self.remember_clips(edit);
+                *edit = added;
+                edit.inherit_detection(&self.batch);
+                self.drag = None;
+            }
+            let mut split = edit.clone();
+            let can_split = split.split_here(info.duration).is_ok();
+            if ui.add_enabled(enabled && can_split, egui::Button::new("Split here"))
+                .on_hover_text("Split the selected clip at the playhead. Move the two new boundaries apart to discard the section between them.").clicked()
+            {
+                self.remember_clips(edit);
+                *edit = split;
+                self.drag = None;
+            }
+            if ui.add_enabled(enabled && !edit.clips.is_empty(), egui::Button::new("Remove clip"))
+                .on_hover_text("Remove the selected kept range from export. The source file is untouched; Undo restores the range.").clicked()
+            {
+                self.remember_clips(edit);
+                edit.remove_clip();
+                edit.inherit_detection(&self.batch);
+                self.drag = None;
+            }
+            let can_undo = self.selected_index()
+                .is_some_and(|index| !self.items[index].clip_undo.is_empty());
+            if ui.add_enabled(enabled && can_undo, egui::Button::new("Undo"))
+                .on_hover_text("Undo Add clip, Split here or Remove clip. Encoding settings are kept. Ctrl+Z when no text field has focus.").clicked()
+            {
+                self.undo_clips(edit);
+            }
+        });
+    }
     fn central_ui(
         &mut self,
         root: &mut egui::Ui,
@@ -1762,15 +2001,39 @@ impl App {
             egui::Panel::bottom("trim_v2").show(ui,|ui| {
                 ui.set_width(trim_width);
                 ui.add_enabled_ui(!self.locked(),|ui| { self.timeline(ui,edit,info); });
+                self.clip_bar(ui,edit,info);
                     ui.columns(2,|columns| {
-                        columns[0].add_enabled_ui(!self.locked(),|ui| {
+                        columns[0].add_enabled_ui(!self.locked() && !edit.clips.is_empty(),|ui| {
                             ui.label(RichText::new("BEGIN").color(GREEN).strong());
-                            ui.horizontal(|ui| { ui.add(egui::TextEdit::singleline(&mut edit.start).desired_width(112.0)).on_hover_text("Inclusive start time: seconds, MM:SS.mmm or HH:MM:SS.mmm."); if ui.button("Here").on_hover_text("Set the green begin marker at the playhead. Keyboard: I.").clicked(){edit.start=time_text(edit.playhead);} });
+                            ui.horizontal(|ui| {
+                                if ui.add(egui::TextEdit::singleline(&mut edit.start).desired_width(112.0))
+                                    .on_hover_text("Inclusive start time for the selected clip: seconds, MM:SS.mmm or HH:MM:SS.mmm.")
+                                    .lost_focus()
+                                {
+                                    edit.constrain_selected(info.duration);
+                                }
+                                if ui.button("Here").on_hover_text("Set the green begin marker at the playhead. Keyboard: I.").clicked() {
+                                    edit.start = time_text(edit.playhead);
+                                    edit.constrain_selected(info.duration);
+                                }
+                            });
                         });
-                        columns[1].add_enabled_ui(!self.locked(),|ui| {
+                        columns[1].add_enabled_ui(!self.locked() && !edit.clips.is_empty(),|ui| {
                             ui.label(RichText::new("END").color(RED).strong());
-                            ui.horizontal(|ui| { if ui.add(egui::TextEdit::singleline(&mut edit.end).desired_width(112.0).hint_text("End of video")).on_hover_text("Exclusive end marker. Empty means the end of the video. Manual changes disable Detect end. Keyboard: O sets End at the playhead.").changed() { edit.discard_auto_end(); }
-                                if ui.button("Here").on_hover_text("Set the red end marker at the playhead and discard Detect end.").clicked(){edit.set_manual_end(edit.playhead);} });
+                            ui.horizontal(|ui| {
+                                let end_response = ui.add(egui::TextEdit::singleline(&mut edit.end).desired_width(112.0).hint_text("End of video"))
+                                    .on_hover_text("Exclusive end marker. Empty means the end of the video. Manual changes disable Detect end. Keyboard: O sets End at the playhead.");
+                                if end_response.changed() {
+                                    edit.discard_auto_end();
+                                }
+                                if end_response.lost_focus() {
+                                    edit.constrain_selected(info.duration);
+                                }
+                                if ui.button("Here").on_hover_text("Set the red end marker at the playhead and discard Detect end.").clicked() {
+                                    edit.set_manual_end(edit.playhead);
+                                    edit.constrain_selected(info.duration);
+                                }
+                            });
                         });
                     });
                     ui.add_space(5.0);
@@ -1817,35 +2080,68 @@ impl App {
         let x = |time: f64| {
             track.left() + ((time / info.duration).clamp(0.0, 1.0) as f32) * track.width()
         };
-        let begin = parse_time(&edit.start)
-            .unwrap_or(0.0)
-            .clamp(0.0, info.duration);
-        let end = optional_time(&edit.end)
-            .ok()
-            .flatten()
-            .unwrap_or(info.duration)
-            .clamp(0.0, info.duration);
         let painter = ui.painter();
-        painter.rect_filled(track, 3.0, Color32::from_rgb(51, 56, 62));
-        if end > begin {
+        painter.rect_filled(track, 3.0, Color32::from_rgb(39, 43, 48));
+        for (index, clip) in edit.clips.iter().enumerate() {
+            let Ok((begin, end)) = clip.range(info.duration) else {
+                continue;
+            };
+            let selected = index == edit.selected_clip;
+            let band = egui::Rect::from_min_max(
+                egui::pos2(x(begin), track.top()),
+                egui::pos2(x(end), track.bottom()),
+            );
             painter.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(x(begin), track.top()),
-                    egui::pos2(x(end), track.bottom()),
-                ),
+                band,
                 2.0,
-                Color32::from_rgb(47, 87, 66),
+                if selected {
+                    Color32::from_rgb(55, 112, 81)
+                } else {
+                    Color32::from_rgb(39, 66, 53)
+                },
             );
-        }
-        for (time, color) in [(begin, GREEN), (end, RED)] {
-            let at = x(time);
-            painter.line_segment(
-                [
-                    egui::pos2(at, track.top() - 10.0),
-                    egui::pos2(at, track.bottom() + 8.0),
-                ],
-                egui::Stroke::new(2.5_f32, color),
-            );
+            if selected {
+                painter.rect_stroke(
+                    band,
+                    2.0,
+                    egui::Stroke::new(1.0, GREEN),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if band.width() > 20.0 {
+                painter.text(
+                    band.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{}", index + 1),
+                    egui::FontId::proportional(10.0),
+                    Color32::WHITE,
+                );
+            }
+            for (time, color, top) in [(begin, GREEN, true), (end, RED, false)] {
+                let at = x(time);
+                painter.line_segment(
+                    [
+                        egui::pos2(at, track.top() - 10.0),
+                        egui::pos2(at, track.bottom() + 8.0),
+                    ],
+                    egui::Stroke::new(if selected { 2.5 } else { 1.3 }, color),
+                );
+                let y = if top {
+                    track.top() - 10.0
+                } else {
+                    track.bottom() + 8.0
+                };
+                let tip = if top { y + 5.0 } else { y - 5.0 };
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(at - 4.0, y),
+                        egui::pos2(at + 4.0, y),
+                        egui::pos2(at, tip),
+                    ],
+                    color,
+                    egui::Stroke::NONE,
+                ));
+            }
         }
         let at = x(edit.playhead);
         painter.line_segment(
@@ -1875,13 +2171,35 @@ impl App {
                 .input(|input| input.pointer.press_origin())
                 .or(response.interact_pointer_pos())
         {
-            self.drag = Some(if (position.x - x(begin)).abs() <= 9.0 {
-                DragTarget::Begin
-            } else if (position.x - x(end)).abs() <= 9.0 {
-                DragTarget::End
-            } else {
-                DragTarget::Playhead
-            });
+            let mut handles = Vec::new();
+            for (index, clip) in edit.clips.iter().enumerate() {
+                if let Ok((begin, end)) = clip.range(info.duration) {
+                    for (time, is_begin) in [(begin, true), (end, false)] {
+                        let distance = (position.x - x(time)).abs();
+                        if distance <= 9.0 {
+                            let side = if (position.y < track.center().y) == is_begin {
+                                0.0
+                            } else {
+                                0.25
+                            };
+                            handles.push((distance + side, index, is_begin, clip.id));
+                        }
+                    }
+                }
+            }
+            handles.sort_by(|a, b| a.0.total_cmp(&b.0));
+            self.drag = Some(
+                if let Some((_, index, is_begin, id)) = handles.first().copied() {
+                    edit.select_clip(index);
+                    if is_begin {
+                        DragTarget::Begin(id)
+                    } else {
+                        DragTarget::End(id)
+                    }
+                } else {
+                    DragTarget::Playhead
+                },
+            );
         }
         if (response.is_pointer_button_down_on() || response.dragged() || response.clicked())
             && let Some(position) = response.interact_pointer_pos()
@@ -1889,16 +2207,37 @@ impl App {
             let time = ((position.x - track.left()) / track.width()).clamp(0.0, 1.0) as f64
                 * info.duration;
             match self.drag.unwrap_or(DragTarget::Playhead) {
-                DragTarget::Playhead => edit.playhead = time.min(seek_max(info)),
-                DragTarget::Begin => {
-                    let value = time.min((end - 0.05).max(0.0));
-                    edit.start = time_text(value);
-                    edit.playhead = value.min(seek_max(info));
+                DragTarget::Playhead => {
+                    if let Some(index) = edit.clips.iter().position(|clip| {
+                        clip.range(info.duration)
+                            .is_ok_and(|(a, b)| time >= a && time <= b)
+                    }) {
+                        edit.select_clip(index);
+                    }
+                    edit.playhead = time.min(seek_max(info));
                 }
-                DragTarget::End => {
-                    let value = time.max((begin + 0.05).min(info.duration));
-                    edit.set_manual_end(value);
-                    edit.playhead = value.min(seek_max(info));
+                DragTarget::Begin(id) | DragTarget::End(id) => {
+                    if let Some(index) = edit.clips.iter().position(|clip| clip.id == id) {
+                        edit.select_clip(index);
+                        let (begin, end) =
+                            edit.range(info.duration).unwrap_or((0.0, info.duration));
+                        match self.drag.unwrap() {
+                            DragTarget::Begin(_) => {
+                                edit.start = time_text(time.min((end - 0.05).max(0.0)))
+                            }
+                            DragTarget::End(_) => {
+                                edit.set_manual_end(time.max((begin + 0.05).min(info.duration)))
+                            }
+                            _ => {}
+                        }
+                        edit.constrain_selected(info.duration);
+                        edit.playhead = if matches!(self.drag, Some(DragTarget::Begin(_))) {
+                            parse_time(&edit.start).unwrap_or(time)
+                        } else {
+                            optional_time(&edit.end).ok().flatten().unwrap_or(time)
+                        }
+                        .min(seek_max(info));
+                    }
                 }
             }
         }
@@ -1908,7 +2247,7 @@ impl App {
         if response.hovered() {
             self.scroll_seek(ui.ctx(), edit, info);
         }
-        response.on_hover_text("Drag to scrub; the image updates while moving. Drag the green or red line to change markers. Scroll to seek.");
+        response.on_hover_text("Drag to scrub; the image updates while moving. Click a clip band to select it. Drag a green begin or red end marker. At a shared boundary, use the upper green or lower red handle. Dark gaps are discarded. Scroll to seek.");
         rect
     }
     fn scroll_seek(&mut self, ctx: &egui::Context, edit: &mut VideoEdit, info: &MediaInfo) {
@@ -1970,11 +2309,13 @@ impl App {
             if input.key_pressed(egui::Key::End) {
                 edit.playhead = seek_max(info);
             }
-            if input.key_pressed(egui::Key::I) {
+            if !edit.clips.is_empty() && input.key_pressed(egui::Key::I) {
                 edit.start = time_text(edit.playhead);
+                edit.constrain_selected(info.duration);
             }
-            if input.key_pressed(egui::Key::O) {
+            if !edit.clips.is_empty() && input.key_pressed(egui::Key::O) {
                 edit.set_manual_end(edit.playhead);
+                edit.constrain_selected(info.duration);
             }
         });
     }
@@ -2056,14 +2397,14 @@ impl App {
     fn footer(&mut self, root: &mut egui::Ui) {
         egui::Panel::bottom("actions_v2").show(root,|ui| {ui.add_space(4.0);ui.horizontal(|ui| {
             if self.busy {if ui.button("Cancel export").clicked(){self.cancel.cancel();}}
-            else {if ui.add_enabled(!self.items.is_empty()&&!self.collecting&&!self.searching()&&!self.finding_batch,egui::Button::new("Process queue").fill(Color32::from_rgb(41,81,60))).on_hover_text("Export every queued video using its own markers and video settings, plus the batch output options. Does not run auto-end searches.").clicked(){self.process_videos(None);}
+            else {if ui.add_enabled(self.items.iter().any(|item|!item.edit.clips.is_empty())&&!self.collecting&&!self.searching()&&!self.finding_batch,egui::Button::new("Process queue").fill(Color32::from_rgb(41,81,60))).on_hover_text("Export all kept clips in queue order using each video's settings and the batch destination. Videos without clips are skipped. Does not run Detect end searches.").clicked(){self.process_videos(None);}
                 if (self.searching()||self.finding_batch)&&ui.button("Cancel search").clicked(){self.cancel_analysis();}}
             if self.busy {
                 let fraction = self.export_activity.as_ref().map(|activity| activity.event.overall).unwrap_or(0.0);
                 ui.add(egui::ProgressBar::new(fraction as f32).desired_width(150.0).text(format!("{:.1}%", fraction * 100.0)).animate(true))
                     .on_hover_text("Progress for this video, including encoding, validation and any quality comparison. Resets only when the next video starts. Stage percentages are weighted.");
             } else if self.finding_batch {ui.add(egui::ProgressBar::new(self.progress).desired_width(150.0).animate(true));}
-            else if let Some(item)=self.items.iter().find(|item|matches!(item.edit.feedback,EndFeedback::Searching)) {ui.spinner();ui.add(egui::ProgressBar::new(item.find_progress).desired_width(150.0).text("Finding end…").animate(true));}
+            else if let Some(item)=self.items.iter().find(|item|item.edit.clips.iter().any(|clip|matches!(clip.feedback,EndFeedback::Searching))) {ui.spinner();ui.add(egui::ProgressBar::new(item.find_progress).desired_width(150.0).text("Finding end…").animate(true));}
             ui.label(&self.status);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add(egui::DragValue::new(&mut self.program.seek_step).range(0.01..=60.0).speed(0.1).suffix(" s")).on_hover_text("Arrow keys and mouse wheel. Shift = 10×; Alt = 0.1×. Text fields keep normal arrow-key editing.");
@@ -2137,6 +2478,12 @@ impl eframe::App for App {
         let actions = self.options_ui(root, &mut edit, info.as_ref());
         self.central_ui(root, &mut edit, info.as_ref());
         self.keyboard_seek(ctx, &mut edit, info.as_ref());
+        if !self.locked()
+            && !ctx.egui_wants_keyboard_input()
+            && ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::Z))
+        {
+            self.undo_clips(&mut edit);
+        }
         if let Some(index) = index {
             self.commit_edit(index, edit);
         }
@@ -2337,6 +2684,25 @@ fn queue_timing(duration: Option<f64>, edit: &VideoEdit) -> String {
         return "Duration unavailable".into();
     };
     let total = compact_time(duration);
+    if edit.clips.is_empty() {
+        return format!("{total} · No clips");
+    }
+    if edit.clips.len() > 1 {
+        if edit.validate_clips(Some(duration)).is_err() {
+            return format!("{total} · Invalid clips");
+        }
+        let kept: f64 = edit
+            .clips
+            .iter()
+            .filter_map(|clip| clip.range(duration).ok())
+            .map(|(a, b)| b - a)
+            .sum();
+        return format!(
+            "{total} · {} clips ({})",
+            edit.clips.len(),
+            compact_time(kept)
+        );
+    }
     let Ok((start, end)) = parse_time(&edit.start).and_then(|start| {
         optional_time(&edit.end).map(|end| (start, end.unwrap_or(duration).min(duration)))
     }) else {
@@ -2692,12 +3058,20 @@ fn output_size_label(ui: &mut egui::Ui, edit: &VideoOptions, info: &MediaInfo) {
     ui.label(RichText::new(format!("{w} × {h} px")).small().color(GREEN)).on_hover_text("Predicted display-oriented pixel dimensions. Resizing rounds down to even pixels and never enlarges.");
 }
 fn cancel_find(item: &mut Item) {
-    if matches!(item.edit.feedback, EndFeedback::Searching) {
+    if item
+        .edit
+        .clips
+        .iter()
+        .any(|clip| matches!(clip.feedback, EndFeedback::Searching))
+    {
         item.find_cancel.cancel();
-        // Invalidate even an already-queued success so Cancel cannot move End.
         item.find_ticket += 1;
         item.find_started = None;
-        item.edit.feedback = EndFeedback::Cancelled;
+        for clip in &mut item.edit.clips {
+            if matches!(clip.feedback, EndFeedback::Searching) {
+                clip.feedback = EndFeedback::Cancelled;
+            }
+        }
     }
 }
 fn detection_ui(
@@ -2797,8 +3171,22 @@ fn detection_ui(
         });
         ui.checkbox(&mut edit.detection.exit_fullscreen, "Exit full screen")
             .on_hover_text("Look for persistent browser-style toolbar bands and text edges. This visual heuristic may miss some applications or match interface-like scenes.");
-        ui.checkbox(&mut edit.detection.loading_spinner, "Spinning load circle")
-            .on_hover_text("Look for a small rotating ring near likely player centers while the surrounding image stays still. Not all spinner designs or positions are recognized.");
+        ui.checkbox(&mut edit.detection.still_picture, "Still picture")
+            .on_hover_text("Detect a picture that stays nearly unchanged for the Down period, allowing small animations such as a loading circle. Static slides can also match. Compared against a fixed picture to reject slow drift.");
+        ui.add_enabled_ui(edit.detection.still_picture, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Changing pixels");
+                let mut percent = edit.detection.still_changed_fraction * 100.0;
+                ui.add(egui::DragValue::new(&mut percent).range(0.0..=25.0).suffix("%"))
+                    .on_hover_text("Maximum part of the image allowed to change. Default 2% ignores small spinners; higher values can mistake quiet video for a still picture.");
+                edit.detection.still_changed_fraction = percent / 100.0;
+            });
+            ui.horizontal(|ui| {
+                ui.label("Pixel tolerance");
+                ui.add(egui::DragValue::new(&mut edit.detection.still_pixel_tolerance).range(0..=255))
+                    .on_hover_text("Ignore RGB channel differences up to this amount (0–255). Default 16 allows minor compression noise.");
+            });
+        });
         ui.horizontal(|ui| {
             ui.checkbox(&mut edit.detection.reference_enabled, "Reference histogram")
                 .on_hover_text("Also match an image's color distribution. This adds another way to end the video; it does not constrain the other selected detectors.");
@@ -3148,19 +3536,19 @@ mod tests {
         }
         h.app
             .tx
-            .send(Message::FindProgress(2, 7, 0.4, None))
+            .send(Message::FindProgress(2, 1, 7, 0.4, None))
             .unwrap();
         h.app
             .tx
-            .send(Message::FindProgress(2, 6, 0.9, None))
+            .send(Message::FindProgress(2, 1, 6, 0.9, None))
             .unwrap();
         h.app
             .tx
-            .send(Message::FindProgress(2, 7, f64::NAN, None))
+            .send(Message::FindProgress(2, 1, 7, f64::NAN, None))
             .unwrap();
         h.app
             .tx
-            .send(Message::FindProgress(2, 7, 0.2, None))
+            .send(Message::FindProgress(2, 1, 7, 0.2, None))
             .unwrap();
         h.app.receive(&h.ctx);
         assert_eq!(h.app.items[0].find_progress, 0.0);
@@ -3188,6 +3576,7 @@ mod tests {
                 item.edit.end = "20".into();
                 item.edit.feedback = EndFeedback::Searching;
                 item.find_ticket = 7;
+                item.find_clip = Some(item.edit.id);
                 item.find_started = Some(Instant::now());
                 item.find_progress = 0.35;
             }
@@ -3212,10 +3601,13 @@ mod tests {
                 }
             );
             assert_eq!(h.app.analysis_cancel.is_cancelled(), batch);
-            h.app.tx.send(Message::Found(1, 7, Ok(Some(12.0)))).unwrap();
             h.app
                 .tx
-                .send(Message::FindProgress(1, 7, 0.9, None))
+                .send(Message::Found(1, 1, 7, Ok(Some(12.0))))
+                .unwrap();
+            h.app
+                .tx
+                .send(Message::FindProgress(1, 1, 7, 0.9, None))
                 .unwrap();
             h.app.receive(&h.ctx);
             assert_eq!(h.app.items[0].edit.end, "20");
@@ -3364,7 +3756,10 @@ mod tests {
         h.app.commit_edit(0, edit);
         h.app.batch.detection.hold_seconds = 5.0;
         h.app.sync_batch_detection();
-        h.app.tx.send(Message::Found(1, 9, Ok(Some(12.0)))).unwrap();
+        h.app
+            .tx
+            .send(Message::Found(1, 1, 9, Ok(Some(12.0))))
+            .unwrap();
         h.app.receive(&h.ctx);
         assert_eq!(h.app.items[0].edit.end, time_text(20.0));
         assert!(!h.app.items[0].edit.auto_end);
@@ -3389,7 +3784,8 @@ mod tests {
         );
         click_text(&mut h, "Per-video settings", 0);
         click_text(&mut h, "Detect end", 0);
-        assert!(h.app.items[0].edit.override_detection);
+        assert!(h.app.items[0].edit.override_auto_end);
+        assert!(!h.app.items[0].edit.override_detection);
         assert!(!h.app.items[0].edit.override_video);
         assert!(!h.app.items[0].edit.auto_end);
         assert!(h.app.items[1].edit.auto_end);
@@ -3476,7 +3872,10 @@ mod tests {
         assert!(h.app.items[0].edit.override_video);
         assert!(h.app.items[0].find_cancel.is_cancelled());
         assert_eq!(h.app.items[0].reference_ticket, 4);
-        h.app.tx.send(Message::Found(1, 7, Ok(Some(12.0)))).unwrap();
+        h.app
+            .tx
+            .send(Message::Found(1, 1, 7, Ok(Some(12.0))))
+            .unwrap();
         h.app.receive(&h.ctx);
         assert_eq!(h.app.items[0].edit.end, "24");
         assert_eq!(h.app.items[0].edit.feedback, EndFeedback::NotSearched);
@@ -4016,7 +4415,7 @@ mod tests {
             assert!(find_cancel.is_cancelled() && probe_cancel.is_cancelled());
             h.app
                 .tx
-                .send(Message::Found(id, 7, Ok(Some(12.0))))
+                .send(Message::Found(id, 1, 7, Ok(Some(12.0))))
                 .unwrap();
             h.app.receive(&h.ctx);
             assert_eq!(h.app.items[0].edit.end, if selected { "20" } else { "" });
@@ -4538,14 +4937,20 @@ mod tests {
         let mut h = Harness::new();
         h.app.items[0].find_ticket = 3;
         h.app.select(2);
-        h.app.tx.send(Message::Found(1, 3, Ok(Some(12.0)))).unwrap();
+        h.app
+            .tx
+            .send(Message::Found(1, 1, 3, Ok(Some(12.0))))
+            .unwrap();
         h.app.receive(&h.ctx);
         assert_eq!(h.app.items[0].edit.end, time_text(12.0));
         assert!(h.app.items[1].edit.end.is_empty());
         let mut edit = h.app.items[0].edit.clone();
         edit.detection.hold_seconds = 20.0;
         h.app.commit_edit(0, edit);
-        h.app.tx.send(Message::Found(1, 3, Ok(Some(8.0)))).unwrap();
+        h.app
+            .tx
+            .send(Message::Found(1, 1, 3, Ok(Some(8.0))))
+            .unwrap();
         h.app.receive(&h.ctx);
         assert_eq!(h.app.items[0].edit.end, time_text(12.0));
     }
@@ -4576,7 +4981,7 @@ mod tests {
         assert!(cancel.is_cancelled());
         h.app
             .tx
-            .send(Message::Found(1, 17, Ok(Some(12.0))))
+            .send(Message::Found(1, 1, 17, Ok(Some(12.0))))
             .unwrap();
         h.app.receive(&h.ctx);
         assert_eq!(h.app.items[0].edit.end, time_text(20.0));
@@ -4822,6 +5227,7 @@ mod tests {
                 .send(Message::Converted(
                     1,
                     Ok(Conversion {
+                        clips: Vec::new(),
                         status: "Done".into(),
                         output: Some("exports/test-1.hevc.mp4".into()),
                         source_removed: moved,
@@ -4998,5 +5404,224 @@ mod tests {
                 .iter()
                 .any(|(text, _)| text == "IN" || text == "OUT" || text == "Auto end")
         );
+    }
+    #[test]
+    fn clip_controls_split_select_remove_and_undo_without_changing_video_options() {
+        let mut h = Harness::new();
+        h.app.items[0].edit.playhead = 10.0;
+        h.frame(Vec::new());
+        click_text(&mut h, "Split here", 0);
+        assert_eq!(h.app.items[0].edit.clips.len(), 2);
+        assert_eq!(h.app.items[0].edit.selected_clip, 1);
+        assert_eq!(h.app.items[0].edit.range(30.0).unwrap(), (10.0, 30.0));
+        click_text(&mut h, "Clip 1 · 0:00–0:10", 0);
+        assert_eq!(h.app.items[0].edit.selected_clip, 0);
+        click_text(&mut h, "Remove clip", 0);
+        assert_eq!(h.app.items[0].edit.clips.len(), 1);
+        h.app.items[0].edit.video.quality = 18;
+        h.app.items[0].edit.override_video = true;
+        click_text(&mut h, "Undo", 0);
+        assert_eq!(h.app.items[0].edit.clips.len(), 2);
+        assert_eq!(h.app.items[0].edit.video.quality, 18);
+        assert!(h.app.items[0].edit.override_video);
+        assert_eq!(h.app.items[1].edit.clips.len(), 1);
+    }
+    #[test]
+    fn removing_all_clips_keeps_the_source_and_add_can_restore_a_range() {
+        let mut h = Harness::new();
+        h.frame(Vec::new());
+        click_text(&mut h, "Remove clip", 0);
+        assert!(h.app.items[0].edit.clips.is_empty());
+        assert_eq!(h.app.items.len(), 2);
+        h.app.items[1].edit.clips.clear();
+        h.app.process_videos(None);
+        assert!(!h.app.busy);
+        click_text(&mut h, "Add clip", 0);
+        assert_eq!(h.app.items[0].edit.clips.len(), 1);
+        assert_eq!(h.app.items[0].edit.range(30.0).unwrap(), (0.0, 30.0));
+    }
+    #[test]
+    fn clip_timeline_selection_and_marker_drags_respect_neighbor_boundaries() {
+        let mut h = Harness::new();
+        h.app.items[0].edit.playhead = 10.0;
+        h.app.items[0].edit.split_here(30.0).unwrap();
+        h.app.items[0].edit.start = "20".into();
+        h.app.items[0].edit.selected_clip = 0;
+        let rect = h.timeline(Vec::new());
+        let x = |time: f32| rect.left() + 8.0 + (rect.width() - 16.0) * time / 30.0;
+        let from = egui::pos2(x(10.0), rect.top() + 28.0);
+        let to = egui::pos2(x(25.0), rect.top() + 28.0);
+        h.timeline(vec![egui::Event::PointerMoved(from), pointer(from, true)]);
+        h.timeline(vec![egui::Event::PointerMoved(to)]);
+        h.timeline(vec![pointer(to, false)]);
+        assert_eq!(h.app.items[0].edit.selected_clip, 0);
+        assert_eq!(h.app.items[0].edit.end, time_text(20.0));
+        assert_eq!(h.app.items[0].edit.clips[1].start, "20");
+        h.app.items[0].edit.validate_clips(Some(30.0)).unwrap();
+        let second = egui::pos2(x(25.0), rect.top() + 28.0);
+        h.timeline(vec![
+            egui::Event::PointerMoved(second),
+            pointer(second, true),
+        ]);
+        h.timeline(vec![pointer(second, false)]);
+        assert_eq!(h.app.items[0].edit.selected_clip, 1);
+    }
+    #[test]
+    fn async_detection_targets_its_clip_after_selection_changes_and_rejects_manual_overrides() {
+        let mut h = Harness::new();
+        let mut edit = h.app.items[0].edit.clone();
+        edit.playhead = 10.0;
+        edit.split_here(30.0).unwrap();
+        edit.selected_clip = 0;
+        edit.auto_end = true;
+        edit.feedback = EndFeedback::Searching;
+        let first = edit.id;
+        let second = edit.clips[1].id;
+        h.app.items[0].edit = edit.clone();
+        h.app.items[0].find_ticket = 7;
+        h.app.items[0].find_clip = Some(first);
+        edit.selected_clip = 1;
+        edit.playhead = 20.0;
+        h.app.commit_edit(0, edit);
+        assert_eq!(h.app.items[0].find_ticket, 7);
+        h.app
+            .tx
+            .send(Message::Found(1, first, 7, Ok(Some(8.0))))
+            .unwrap();
+        h.app.receive(&h.ctx);
+        assert_eq!(h.app.items[0].edit.clips[0].end, time_text(8.0));
+        assert_eq!(h.app.items[0].edit.id, second);
+        assert_eq!(h.app.items[0].edit.playhead, 20.0);
+        assert!(h.app.items[0].edit.end.is_empty());
+        let mut edit = h.app.items[0].edit.clone();
+        edit.selected_clip = 0;
+        edit.feedback = EndFeedback::Searching;
+        h.app.items[0].edit = edit.clone();
+        h.app.items[0].find_ticket = 11;
+        edit.set_manual_end(9.0);
+        h.app.commit_edit(0, edit);
+        h.app
+            .tx
+            .send(Message::Found(1, first, 11, Ok(Some(6.0))))
+            .unwrap();
+        h.app.receive(&h.ctx);
+        assert_eq!(h.app.items[0].edit.end, time_text(9.0));
+        assert!(!h.app.items[0].edit.auto_end);
+    }
+    #[test]
+    fn split_queue_times_summarize_all_kept_ranges() {
+        let mut edit = VideoEdit {
+            playhead: 10.0,
+            ..Default::default()
+        };
+        edit.split_here(30.0).unwrap();
+        edit.start = "20".into();
+        assert_eq!(queue_timing(Some(30.0), &edit), "0:30 · 2 clips (0:20)");
+        edit.selected_clip = 0;
+        assert_eq!(queue_timing(Some(30.0), &edit), "0:30 · 2 clips (0:20)");
+        edit.clips.clear();
+        assert_eq!(queue_timing(Some(30.0), &edit), "0:30 · No clips");
+    }
+    #[test]
+    fn clip_undo_never_restores_an_orphaned_search() {
+        let mut h = Harness::new();
+        let mut edit = h.app.items[0].edit.clone();
+        edit.auto_end = true;
+        edit.feedback = EndFeedback::Searching;
+        edit.search_limit = Some("30".into());
+        h.app.items[0].edit = edit.clone();
+        h.app.items[0].find_clip = Some(edit.id);
+        let ticket = h.app.items[0].find_ticket;
+        h.app.remember_clips(&edit);
+        edit.remove_clip();
+        h.app.commit_edit(0, edit.clone());
+        h.app.undo_clips(&mut edit);
+        h.app.commit_edit(0, edit);
+        assert!(!h.app.searching());
+        assert_eq!(h.app.items[0].edit.feedback, EndFeedback::Cancelled);
+        assert!(h.app.items[0].edit.search_limit.is_none());
+        h.app
+            .tx
+            .send(Message::Found(1, 1, ticket, Ok(Some(8.0))))
+            .unwrap();
+        h.app.receive(&h.ctx);
+        assert!(h.app.items[0].edit.end.is_empty());
+    }
+    #[test]
+    fn split_source_removal_updates_queue_to_every_export_with_video_overrides() {
+        for moved in [false, true] {
+            let mut h = Harness::new();
+            h.app.items[0].edit.video.quality = 18;
+            h.app.items[0].edit.override_video = true;
+            h.app.items[0].edit.playhead = 10.0;
+            h.app.items[0].edit.split_here(30.0).unwrap();
+            let original = h.app.items[0].input.path.clone();
+            let clip = |number| Conversion {
+                clips: Vec::new(),
+                status: "Done".into(),
+                output: Some(format!("exports/test-1-{number}.hevc.mp4").into()),
+                source_removed: false,
+                warning: None,
+                start: 0.0,
+                end: 10.0,
+                encoder: "libx265".into(),
+                saved_bytes: 100,
+                quality: Vec::new(),
+            };
+            let mut result = clip(1);
+            result.clips = vec![clip(1), clip(2)];
+            result.source_removed = moved;
+            h.app.tx.send(Message::Converted(1, Ok(result))).unwrap();
+            h.app.receive(&h.ctx);
+            if moved {
+                assert_eq!(h.app.items.len(), 3);
+                for (id, number) in [(1, 1), (3, 2)] {
+                    let item = &h.app.items[h.app.index(id).unwrap()];
+                    assert_eq!(
+                        item.input.path,
+                        PathBuf::from(format!("exports/test-1-{number}.hevc.mp4"))
+                    );
+                    assert_eq!(item.edit.clips.len(), 1);
+                    assert_eq!(parse_time(&item.edit.start).unwrap(), 0.0);
+                    assert!(item.edit.end.is_empty());
+                    assert!(!item.edit.auto_end);
+                    assert_eq!(item.edit.video.quality, 18);
+                    assert!(item.edit.override_video);
+                    assert_eq!(item.status, "Done");
+                }
+            } else {
+                assert_eq!(h.app.items.len(), 2);
+                assert_eq!(h.app.items[0].input.path, original);
+                assert_eq!(h.app.items[0].edit.clips.len(), 2);
+            }
+            assert_eq!(
+                h.app.items[h.app.index(2).unwrap()].input.path,
+                PathBuf::from("test-2.mp4")
+            );
+            assert_eq!(h.app.selected, Some(1));
+        }
+    }
+    #[test]
+    fn changing_the_next_clip_boundary_cancels_search_and_rejects_its_late_reply() {
+        let mut h = Harness::new();
+        let mut edit = h.app.items[0].edit.clone();
+        edit.playhead = 10.0;
+        edit.split_here(30.0).unwrap();
+        edit.clips[0].auto_end = true;
+        edit.clips[0].feedback = EndFeedback::Searching;
+        let clip_id = edit.clips[0].id;
+        h.app.items[0].edit = edit.clone();
+        h.app.items[0].find_ticket = 5;
+        h.app.items[0].find_clip = Some(clip_id);
+        edit.start = "12".into();
+        h.app.commit_edit(0, edit);
+        assert!(!h.app.searching());
+        assert_eq!(h.app.items[0].edit.clips[0].feedback, EndFeedback::Stale);
+        h.app
+            .tx
+            .send(Message::Found(1, clip_id, 5, Ok(Some(8.0))))
+            .unwrap();
+        h.app.receive(&h.ctx);
+        assert_eq!(h.app.items[0].edit.clips[0].end, time_text(10.0));
     }
 }
