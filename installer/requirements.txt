@@ -1,0 +1,12 @@
+Tailout uses FFmpeg and FFprobe to read, preview and process videos.
+
+Install FFmpeg 6 or newer with the libx265 encoder before using Tailout.
+Both ffmpeg.exe and ffprobe.exe must be on PATH, or placed in the same folder
+as tailout.exe. These tools are not included in this installer.
+
+Windows builds are linked from https://ffmpeg.org/download.html
+NVIDIA encoding also needs a compatible NVIDIA GPU and driver.
+
+Tailout installs for your Windows account without administrator privileges.
+Upgrading or uninstalling preserves your saved preferences, presets and videos.
+Close Tailout before upgrading so an active export is never interrupted.
